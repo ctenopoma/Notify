@@ -5,6 +5,7 @@ use tauri::Manager;
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_autostart::MacosLauncher;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct AppConfig {
@@ -23,7 +24,7 @@ impl Default for AppConfig {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct AlertStatus {
-    pub state: String, // "firing", "suppressed", "unprocessed"
+    pub state: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -36,6 +37,25 @@ pub struct Alert {
     pub starts_at: String,
     #[serde(rename = "generatorURL")]
     pub generator_url: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct SilenceMatcher {
+    name: String,
+    value: String,
+    isRegex: bool,
+    isEqual: bool,
+}
+
+#[derive(serde::Serialize)]
+#[allow(non_snake_case)]
+struct SilencePayload {
+    matchers: Vec<SilenceMatcher>,
+    startsAt: String,
+    endsAt: String,
+    createdBy: String,
+    comment: String,
 }
 
 pub struct AppState {
@@ -65,14 +85,12 @@ async fn save_config(
         config.alertmanager_urls = urls;
         config.polling_interval_secs = interval;
 
-        // Save configuration file
         if let Ok(content) = serde_json::to_string_pretty(&*config) {
             if let Err(e) = std::fs::write(&state.config_path, content) {
                 return Err(format!("Failed to save config file: {}", e));
             }
         }
     }
-    // Interrupt the sleep and trigger immediate poll
     state.config_changed_notify.notify_one();
     Ok(())
 }
@@ -91,7 +109,6 @@ async fn get_connection_errors(state: tauri::State<'_, AppState>) -> Result<Hash
 
 #[tauri::command]
 async fn trigger_poll_now(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // Notify the background task to wake up immediately
     state.config_changed_notify.notify_one();
     Ok(())
 }
@@ -106,6 +123,56 @@ async fn open_config_dir(state: tauri::State<'_, AppState>, app_handle: tauri::A
     Ok(())
 }
 
+#[tauri::command]
+async fn create_silence(state: tauri::State<'_, AppState>, alertname: String, duration_hours: u64) -> Result<(), String> {
+    let urls = state.config.read().await.alertmanager_urls.clone();
+    
+    let now = chrono::Utc::now();
+    let ends_at = now + chrono::Duration::hours(duration_hours as i64);
+    
+    let payload = SilencePayload {
+        matchers: vec![SilenceMatcher {
+            name: "alertname".to_string(),
+            value: alertname,
+            isRegex: false,
+            isEqual: true,
+        }],
+        startsAt: now.to_rfc3339(),
+        endsAt: ends_at.to_rfc3339(),
+        createdBy: "Notify App".to_string(),
+        comment: "Silenced via Notify desktop app".to_string(),
+    };
+
+    let client = reqwest::Client::builder().no_proxy().build().map_err(|e| e.to_string())?;
+    
+    for base_url in urls {
+        let clean_url = base_url.trim_end_matches('/');
+        let api_url = format!("{}/api/v2/silences", clean_url);
+        // Fire and forget
+        let _ = client.post(&api_url).json(&payload).send().await;
+    }
+    
+    // Trigger poll to fetch updated alerts
+    state.config_changed_notify.notify_one();
+    Ok(())
+}
+
+fn update_tray_icon(app_handle: &tauri::AppHandle, has_error: bool) {
+    if let Some(tray) = app_handle.tray_by_id("main") {
+        if has_error {
+            // Generate a simple 16x16 red square as error icon
+            let rgba = vec![255, 0, 0, 255].repeat(16 * 16);
+            let img = tauri::image::Image::new(&rgba, 16, 16);
+            let _ = tray.set_icon(Some(img));
+        } else {
+            // Restore default icon
+            if let Some(default_icon) = app_handle.default_window_icon().cloned() {
+                let _ = tray.set_icon(Some(default_icon));
+            }
+        }
+    }
+}
+
 async fn run_polling_cycle(
     urls: &[String],
     app_handle: &tauri::AppHandle,
@@ -113,7 +180,7 @@ async fn run_polling_cycle(
 ) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
-        .no_proxy() // Important: By-pass system proxy
+        .no_proxy()
         .build()
     {
         Ok(c) => c,
@@ -160,13 +227,11 @@ async fn run_polling_cycle(
         }
     }
 
-    // Update connection errors state
     {
         let mut err_state = state.connection_errors.write().await;
         *err_state = current_errors;
     }
 
-    // Check all down logic
     let is_all_down = total_urls > 0 && failed_urls == total_urls;
     let mut all_down_flag = state.all_down_notified.write().await;
     if is_all_down && !*all_down_flag {
@@ -186,18 +251,20 @@ async fn run_polling_cycle(
     }
 
     let current_firing_alerts: Vec<Alert> = merged_firing_alerts.into_values().collect();
+    
+    // Update tray icon status based on errors or critical alerts
+    let has_critical = current_firing_alerts.iter().any(|a| a.labels.get("severity").map(|s| s.as_str()) == Some("critical"));
+    let has_error = failed_urls > 0 || has_critical;
+    update_tray_icon(app_handle, has_error);
 
-    // Identify resolved alerts and process new firing notifications
     {
         let mut active_cache = state.active_alerts.write().await;
         let current_firing_fps: HashSet<String> = current_firing_alerts.iter().map(|a| a.fingerprint.clone()).collect();
         
         let mut notified = state.notified_fingerprints.write().await;
 
-        // Process newly resolved alerts
         for prev_alert in active_cache.iter() {
             if !current_firing_fps.contains(&prev_alert.fingerprint) && notified.contains(&prev_alert.fingerprint) {
-                // It was firing and notified, but now it's gone -> Resolved!
                 let alertname = prev_alert.labels.get("alertname").map(|s| s.as_str()).unwrap_or("Unknown Alert");
                 let title = format!("[RESOLVED] {}", alertname);
                 
@@ -209,10 +276,8 @@ async fn run_polling_cycle(
             }
         }
 
-        // Clean up resolved alerts from notified history
         notified.retain(|fp| current_firing_fps.contains(fp));
 
-        // Process newly firing alerts
         for alert in &current_firing_alerts {
             if !notified.contains(&alert.fingerprint) {
                 let alertname = alert.labels.get("alertname").map(|s| s.as_str()).unwrap_or("Unknown Alert");
@@ -234,7 +299,6 @@ async fn run_polling_cycle(
             }
         }
 
-        // Update active cache
         *active_cache = current_firing_alerts;
     }
 }
@@ -242,6 +306,7 @@ async fn run_polling_cycle(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, Some(vec!["--minimized"])))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
@@ -283,7 +348,7 @@ pub fn run() {
                 tauri::Error::AssetNotFound("Default window icon not found".to_string())
             })?;
 
-            let _tray = TrayIconBuilder::new()
+            let _tray = TrayIconBuilder::with_id("main")
                 .icon(default_icon)
                 .menu(&menu)
                 .on_menu_event(|app: &tauri::AppHandle, event| {
@@ -328,12 +393,9 @@ pub fn run() {
 
                     run_polling_cycle(&urls, &app_handle, &app_state).await;
 
-                    // Sleep for 'interval' seconds, but wake up immediately if config changes
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
-                        _ = app_state.config_changed_notify.notified() => {
-                            // Config changed or immediate poll requested, loop will instantly restart
-                        }
+                        _ = app_state.config_changed_notify.notified() => {}
                     }
                 }
             });
@@ -352,7 +414,8 @@ pub fn run() {
             get_active_alerts,
             get_connection_errors,
             trigger_poll_now,
-            open_config_dir
+            open_config_dir,
+            create_silence
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

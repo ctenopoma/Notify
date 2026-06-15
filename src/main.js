@@ -123,6 +123,12 @@ function renderAlerts(alerts) {
       `;
     }
 
+    actionBtnHtml += `
+      <button type="button" class="btn outline-btn small-btn mute-btn" data-alertname="${alertname}" title="1時間ミュートする">
+        🔕 ミュート
+      </button>
+    `;
+
     let labelPillsHtml = '';
     Object.entries(alert.labels).forEach(([key, val]) => {
       if (key !== 'alertname' && key !== 'severity') {
@@ -148,6 +154,23 @@ function renderAlerts(alerts) {
     `;
 
     alertsList.appendChild(card);
+  });
+
+  // Bind mute button events
+  document.querySelectorAll('.mute-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const alertname = e.currentTarget.getAttribute('data-alertname');
+      e.currentTarget.disabled = true;
+      try {
+        await invoke('create_silence', { alertname: alertname, durationHours: 1 });
+        showToast(`「${alertname}」を1時間ミュートしました`);
+        setTimeout(fetchAlerts, 1000);
+      } catch (err) {
+        console.error(err);
+        showToast('ミュート設定に失敗しました');
+        e.currentTarget.disabled = false;
+      }
+    });
   });
 }
 
@@ -378,6 +401,27 @@ window.addEventListener('DOMContentLoaded', () => {
       console.error(err);
       showToast('フォルダを開くのに失敗しました');
     });
+  });
+
+  const autostartToggle = document.getElementById('autostart-toggle');
+  
+  // Initialize autostart toggle state
+  invoke('plugin:autostart|is_enabled')
+    .then(enabled => { autostartToggle.checked = enabled; })
+    .catch(console.error);
+
+  autostartToggle.addEventListener('change', async (e) => {
+    try {
+      if (e.target.checked) {
+        await invoke('plugin:autostart|enable');
+      } else {
+        await invoke('plugin:autostart|disable');
+      }
+    } catch (err) {
+      console.error('Failed to change autostart setting', err);
+      showToast('自動起動の設定変更に失敗しました');
+      e.target.checked = !e.target.checked; // Revert
+    }
   });
 
   // Listen for window focus event (when brought up from tray)

@@ -91,7 +91,15 @@
               <span class="help-text">Alertmanager APIを見に行く頻度を設定します。</span>
             </div>
 
-            <div class="form-actions">
+            <div class="form-group" style="margin-top: 24px;">
+              <label for="autostart-toggle" style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="autostart-toggle" style="width: 16px; height: 16px;">
+                Windows起動時に自動的に開始する
+              </label>
+              <span class="help-text">PC起動時にバックグラウンドで自動的に監視を開始します。</span>
+            </div>
+
+            <div class="form-actions" style="margin-top: 24px;">
               <button id="save-btn" class="btn primary-btn">
                 <span>設定を保存</span>
               </button>
