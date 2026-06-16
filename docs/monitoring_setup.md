@@ -753,6 +753,30 @@ sudo ufw status
 | 温度は高いのにスロットリングが出ない | `DCGM_FI_DEV_THERMAL_VIOLATION` は累積カウンタ。`rate(...[5m]) > 0` で「いま絞られているか」を判定している。閾値手前の予兆は `GPUTemperatureHigh` で拾う。 |
 | Grafana にデータが出ない | データソース URL（`http://prometheus:9090` / `http://loki:3100`）は **compose 内のサービス名**で解決される。同じ `monitor` ネットワークにいるか確認。 |
 
+### 9.1 `dcgm-exporter` のログに `skipping ... (DCGM_FI_PROF_xxx): dcp metrics not enabled` と出る場合
+
+PROF 系（`DCGM_FI_PROF_*`）は DCGM の **DCP（プロファイリング）モジュール**経由で取得します。このログは DCP モジュールが有効化できておらず、PROF 系メトリクスだけが収集対象から外れている状態を示します（DEV 系のクロック・温度・FB などは通常そのまま出ます）。原因は主に次の3つです。上から順に確認してください。
+
+1. **`SYS_ADMIN` capability が無い**
+   プロファイリング系は `cap_add: SYS_ADMIN` が無いと DCP モジュールを初期化できません。4章の `docker-compose.yml` の `dcgm-exporter` サービスに `cap_add: [SYS_ADMIN]` が入っているか確認し、無ければ追加して再起動します。
+   ```bash
+   docker compose up -d --force-recreate dcgm-exporter
+   docker logs dcgm-exporter | grep -i -E 'profil|dcp'
+   ```
+
+2. **GPU がプロファイリング（DCP）非対応**
+   DCP はデータセンタ向け GPU（Tesla/Volta 以降の T4・V100・A100・H100 等）が対象で、**GeForce/RTX などコンシューマ向け GPU は基本的に非対応**です。コンテナ内から確認できます。
+   ```bash
+   docker exec dcgm-exporter dcgmi discovery -l   # GPU 一覧とモデル名を確認
+   docker exec dcgm-exporter dcgmi profile --list  # 対応していなければエラーまたは空で返る
+   ```
+   非対応の GPU であれば PROF 系の収集は不可能なので、`dcgm-counters.csv` から `DCGM_FI_PROF_*` の行を削除し、DEV 系メトリクス（`DCGM_FI_DEV_GPU_UTIL` など）で代替してください。
+
+3. **MIG（Multi-Instance GPU）構成によりプロファイリングが使えない**
+   MIG を有効化している場合、GPU インスタンスの分割サイズによってはプロファイリングが提供されません。`dcgmi discovery -c` で MIG 構成を確認し、必要であれば該当 GPU を MIG 無効（フルGPU）に戻すか、対応プロファイルに変更してください。
+
+> 上記のいずれにも該当しないにもかかわらず解決しない場合は、ホストの NVIDIA ドライバと `dcgm-exporter` イメージ内の DCGM ライブラリのバージョン不整合が疑われます。`nvidia-smi` のドライババージョンと、`docker exec dcgm-exporter dcgmi -v` のバージョンを確認し、`dcgm-exporter` のイメージタグをドライバに対応したものへ変更してください。
+
 ---
 
 ## 10. 監視対象・しきい値の追加・変更
