@@ -186,7 +186,7 @@ async fn create_silence(state: tauri::State<'_, AppState>, alertname: String, du
 
 fn alerts_contain_firing_heartbeat(alerts: &[Alert], heartbeat_alert_name: &str) -> bool {
     alerts.iter().any(|alert| {
-        alert.status.state == "firing"
+        alert.status.state == "active"
             && alert.labels.get("alertname").map(|s| s.as_str()) == Some(heartbeat_alert_name)
     })
 }
@@ -256,7 +256,7 @@ async fn run_polling_cycle(
                         Ok(alerts) => {
                             reachable = true;
                             for alert in &alerts {
-                                if alert.status.state == "firing" {
+                                if alert.status.state == "active" {
                                     merged_firing_alerts.insert(alert.fingerprint.clone(), alert.clone());
                                 }
                             }
@@ -523,22 +523,22 @@ mod tests {
     #[test]
     fn heartbeat_detected_when_firing_and_named_match() {
         let alerts = vec![
-            alert_with("SomeOtherAlert", "firing"),
-            alert_with("AlwaysFiringTest", "firing"),
+            alert_with("SomeOtherAlert", "active"),
+            alert_with("AlwaysFiringTest", "active"),
         ];
         assert!(alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
     }
 
     #[test]
     fn heartbeat_not_detected_when_absent() {
-        let alerts = vec![alert_with("SomeOtherAlert", "firing")];
+        let alerts = vec![alert_with("SomeOtherAlert", "active")];
         assert!(!alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
     }
 
     #[test]
     fn heartbeat_not_detected_when_resolved() {
-        // A test alert that has stopped firing must not count as a live connection check.
-        let alerts = vec![alert_with("AlwaysFiringTest", "resolved")];
+        // A test alert that is silenced/suppressed must not count as a live connection check.
+        let alerts = vec![alert_with("AlwaysFiringTest", "suppressed")];
         assert!(!alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
     }
 
