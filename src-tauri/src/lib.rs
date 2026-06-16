@@ -191,6 +191,14 @@ fn alerts_contain_firing_heartbeat(alerts: &[Alert], heartbeat_alert_name: &str)
     })
 }
 
+// The heartbeat/test alert (e.g. "AlwaysFiringTest") exists purely to verify the
+// delivery path. It must never be surfaced to the user as a real alert, neither in
+// the alert list nor as a desktop notification.
+fn is_heartbeat_alert(alert: &Alert, heartbeat_alert_name: &str) -> bool {
+    !heartbeat_alert_name.trim().is_empty()
+        && alert.labels.get("alertname").map(|s| s.as_str()) == Some(heartbeat_alert_name)
+}
+
 fn update_tray_icon(app_handle: &tauri::AppHandle, has_error: bool) {
     if let Some(tray) = app_handle.tray_by_id("main") {
         if has_error {
@@ -256,7 +264,9 @@ async fn run_polling_cycle(
                         Ok(alerts) => {
                             reachable = true;
                             for alert in &alerts {
-                                if alert.status.state == "active" {
+                                if alert.status.state == "active"
+                                    && !is_heartbeat_alert(alert, heartbeat_alert_name)
+                                {
                                     merged_firing_alerts.insert(alert.fingerprint.clone(), alert.clone());
                                 }
                             }
@@ -553,6 +563,25 @@ mod tests {
         let heartbeat_seen = false;
         let connected = reachable && (heartbeat_seen || !heartbeat_required);
         assert!(connected);
+    }
+
+    #[test]
+    fn heartbeat_alert_is_identified_for_exclusion() {
+        let heartbeat = alert_with("AlwaysFiringTest", "active");
+        assert!(is_heartbeat_alert(&heartbeat, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn non_heartbeat_alert_is_not_excluded() {
+        let real = alert_with("InstanceDown", "active");
+        assert!(!is_heartbeat_alert(&real, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn nothing_is_excluded_when_heartbeat_name_is_empty() {
+        // With the heartbeat feature disabled, no alert should be treated as a probe.
+        let probe = alert_with("AlwaysFiringTest", "active");
+        assert!(!is_heartbeat_alert(&probe, ""));
     }
 
     #[test]
