@@ -1,7 +1,7 @@
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tauri::Manager;
+use tauri::{Manager, Emitter};
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri_plugin_notification::NotificationExt;
@@ -40,21 +40,48 @@ pub struct ServerStatus {
     pub checked_at: String,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
 pub struct AlertStatus {
+    #[serde(default)]
     pub state: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct Alert {
     pub fingerprint: String,
+    // Alertmanager always sends these, but we default them so that a single
+    // field omitted by an upstream (or a future schema tweak) can't make an
+    // otherwise-valid alert undeserializable.
+    #[serde(default)]
     pub status: AlertStatus,
+    #[serde(default)]
     pub labels: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub annotations: std::collections::HashMap<String, String>,
     #[serde(rename = "startsAt")]
     pub starts_at: String,
     #[serde(rename = "generatorURL")]
     pub generator_url: Option<String>,
+}
+
+// Deserialize the /api/v2/alerts array element-by-element so that one
+// non-conforming alert can't discard the entire response. Previously a single
+// unexpected alert shape (e.g. a missing field) made `resp.json::<Vec<Alert>>()`
+// fail wholesale, so even a perfectly valid heartbeat alert went unseen and the
+// server was reported as "テスト未到達" despite the test alert being present.
+fn parse_alerts_lenient(body: &str) -> Result<Vec<Alert>, serde_json::Error> {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(body)?;
+    let alerts = raw
+        .into_iter()
+        .filter_map(|value| match serde_json::from_value::<Alert>(value) {
+            Ok(alert) => Some(alert),
+            Err(e) => {
+                eprintln!("Skipping unparsable alert in response: {}", e);
+                None
+            }
+        })
+        .collect();
+    Ok(alerts)
 }
 
 #[derive(serde::Serialize)]
@@ -260,7 +287,9 @@ async fn run_polling_cycle(
         match client.get(&api_url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<Vec<Alert>>().await {
+                    match resp.text().await.map_err(|e| e.to_string())
+                        .and_then(|body| parse_alerts_lenient(&body).map_err(|e| e.to_string()))
+                    {
                         Ok(alerts) => {
                             reachable = true;
                             for alert in &alerts {
@@ -445,9 +474,11 @@ pub fn run() {
                 .on_menu_event(|app: &tauri::AppHandle, event| {
                     match event.id.as_ref() {
                         "show" => {
+                            // "設定を開く": surface the window on the settings tab.
                             if let Some(window) = app.get_webview_window("main") {
                                 let _ = window.show();
                                 let _ = window.set_focus();
+                                let _ = window.emit("navigate-view", "settings-view");
                             }
                         }
                         "quit" => {
@@ -466,6 +497,8 @@ pub fn run() {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
+                            // Quick-look: a left click jumps straight to the live alert list.
+                            let _ = window.emit("navigate-view", "alerts-view");
                         }
                     }
                 })
@@ -582,6 +615,55 @@ mod tests {
         // With the heartbeat feature disabled, no alert should be treated as a probe.
         let probe = alert_with("AlwaysFiringTest", "active");
         assert!(!is_heartbeat_alert(&probe, ""));
+    }
+
+    #[test]
+    fn lenient_parse_keeps_valid_alerts_when_one_is_malformed() {
+        // The heartbeat is well-formed; a sibling alert carries a non-string
+        // label value. The old `Vec<Alert>` parse would reject the whole batch,
+        // hiding the heartbeat. Lenient parsing must keep the good alert.
+        let body = r#"[
+            {
+                "fingerprint": "good",
+                "status": {"state": "active"},
+                "labels": {"alertname": "AlwaysFiringTest", "severity": "warning"},
+                "annotations": {"summary": "ok"},
+                "startsAt": "2024-01-01T00:00:00Z"
+            },
+            {
+                "fingerprint": "bad",
+                "status": {"state": "active"},
+                "labels": {"alertname": "Weird", "port": 9093},
+                "annotations": {},
+                "startsAt": "2024-01-01T00:00:00Z"
+            }
+        ]"#;
+        let alerts = parse_alerts_lenient(body).expect("array should parse");
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn lenient_parse_tolerates_missing_annotations() {
+        // An alert without an `annotations` field must still deserialize.
+        let body = r#"[
+            {
+                "fingerprint": "noann",
+                "status": {"state": "active"},
+                "labels": {"alertname": "AlwaysFiringTest"},
+                "startsAt": "2024-01-01T00:00:00Z"
+            }
+        ]"#;
+        let alerts = parse_alerts_lenient(body).expect("array should parse");
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].annotations.is_empty());
+        assert!(alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn lenient_parse_errors_only_when_not_an_array() {
+        // A non-array body is a genuine protocol error and must still surface.
+        assert!(parse_alerts_lenient("{\"not\":\"an array\"}").is_err());
     }
 
     #[test]

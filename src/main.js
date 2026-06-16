@@ -25,6 +25,7 @@ let toastMsg;
 let pollingTimer = null;
 let currentInterval = 60;
 let manualStatusUntil = 0; // suppress auto status overwrite while a manual sync message is shown
+let lastAlertsSignature = null; // skip rebuilding the list when nothing changed (prevents flicker)
 
 // Show temporary toast notification
 function showToast(message, duration = 3000) {
@@ -78,9 +79,40 @@ function fnFormatRelativeTime(isoString) {
 
 // Render active alerts list with Sorting
 function renderAlerts(alerts) {
+  // Sorting: Critical -> Warning -> Info, then by newest.
+  // Work on a copy so the signature reflects the displayed order.
+  const severityWeight = { critical: 3, warning: 2, info: 1 };
+  const list = (alerts || []).slice().sort((a, b) => {
+    const sevA = severityWeight[(a.labels.severity || '').toLowerCase()] || 0;
+    const sevB = severityWeight[(b.labels.severity || '').toLowerCase()] || 0;
+    if (sevA !== sevB) return sevB - sevA; // Descending weight
+    return new Date(b.startsAt) - new Date(a.startsAt); // Newest first
+  });
+
+  // Compute a signature of the meaningful content. If it hasn't changed since
+  // the last render, skip rebuilding the DOM entirely: a full innerHTML rebuild
+  // every poll re-triggered each card's slideIn animation, which showed up as
+  // flicker and as alerts appearing to "re-display" repeatedly.
+  const signature = JSON.stringify(list.map(a => [
+    a.fingerprint,
+    (a.labels.severity || '').toLowerCase(),
+    a.startsAt,
+    a.annotations.summary || a.annotations.description || ''
+  ]));
+
+  if (signature === lastAlertsSignature) {
+    // Nothing structurally changed; just keep the relative timestamps fresh
+    // in place (no rebuild, so no animation replay).
+    alertsList.querySelectorAll('.alert-time[data-starts-at]').forEach(el => {
+      el.textContent = fnFormatRelativeTime(el.getAttribute('data-starts-at'));
+    });
+    return;
+  }
+  lastAlertsSignature = signature;
+
   alertsList.innerHTML = '';
-  
-  if (!alerts || alerts.length === 0) {
+
+  if (list.length === 0) {
     emptyState.classList.remove('hide');
     alertsList.classList.add('hide');
     alertCountBadge.classList.add('hide');
@@ -90,21 +122,11 @@ function renderAlerts(alerts) {
 
   emptyState.classList.add('hide');
   alertsList.classList.remove('hide');
-  
+
   alertCountBadge.classList.remove('hide');
-  alertCountBadge.textContent = alerts.length;
+  alertCountBadge.textContent = list.length;
 
-  // Sorting: Critical -> Warning -> Info, then by newest
-  const severityWeight = { critical: 3, warning: 2, info: 1 };
-  
-  alerts.sort((a, b) => {
-    const sevA = severityWeight[(a.labels.severity || '').toLowerCase()] || 0;
-    const sevB = severityWeight[(b.labels.severity || '').toLowerCase()] || 0;
-    if (sevA !== sevB) return sevB - sevA; // Descending weight
-    return new Date(b.startsAt) - new Date(a.startsAt); // Newest first
-  });
-
-  alerts.forEach(alert => {
+  list.forEach(alert => {
     const card = document.createElement('div');
     const severity = (alert.labels.severity || 'warning').toLowerCase();
     card.className = `alert-card severity-${severity}`;
@@ -144,7 +166,7 @@ function renderAlerts(alerts) {
           <span class="alert-name">${alertname}</span>
           <span class="severity-badge">${severity}</span>
         </div>
-        <span class="alert-time">${relativeTime}</span>
+        <span class="alert-time" data-starts-at="${alert.startsAt}">${relativeTime}</span>
       </div>
       <div class="alert-body">${summary}</div>
       <div class="alert-footer">
@@ -504,11 +526,20 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Listen for window focus event (when brought up from tray)
+  // Refresh data whenever the window regains focus, but DON'T change the active
+  // tab — previously this forced the alerts view on every focus gain, so simply
+  // clicking back into the settings screen yanked the user away to the alert list.
   window.__TAURI__.event.listen('tauri://focus', () => {
-    // 1. Force switch to alerts view to ensure they see the most critical info immediately
-    switchTab('alerts-view');
-    // 2. Fetch the latest state instantly
+    fetchAlerts();
+  });
+
+  // Navigation is driven explicitly by the tray: a left click on the icon asks
+  // for the alert list (quick look), while the "設定を開く" menu asks for settings.
+  window.__TAURI__.event.listen('navigate-view', (event) => {
+    const target = event.payload;
+    if (target === 'alerts-view' || target === 'settings-view') {
+      switchTab(target);
+    }
     fetchAlerts();
   });
 
