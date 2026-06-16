@@ -179,6 +179,9 @@ function renderAlerts(alerts) {
 // Render connection errors UI
 function renderConnectionErrors(errors) {
   const headerStatus = document.querySelector('.header-status');
+  // Guard against a missing container so a render error here can never abort the
+  // rest of the status refresh (server badges, overall status, etc.).
+  if (!headerStatus) return;
   // Remove existing error badge
   const existingBadge = headerStatus.querySelector('.error-badge');
   if (existingBadge) existingBadge.remove();

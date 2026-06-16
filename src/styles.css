@@ -243,6 +243,12 @@ body {
   opacity: 1;
 }
 
+/* Hide the empty-state / alert list when the other is active so they never overlap */
+.empty-state.hide,
+.alerts-list.hide {
+  display: none;
+}
+
 /* Empty State */
 .empty-state {
   display: flex;
