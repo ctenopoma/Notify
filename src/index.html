@@ -83,6 +83,12 @@
             </div>
 
             <div class="form-group">
+              <label for="input-heartbeat-name">テスト用アラート名（ハートビート）</label>
+              <input type="text" id="input-heartbeat-name" placeholder="AlwaysFiringTest" />
+              <span class="help-text">常時発火するテスト用アラートのalertname。このアラートが実際に受信できた場合のみ、サーバーを「接続中」と判定します。空欄にするとAPI応答のみで判定します。</span>
+            </div>
+
+            <div class="form-group">
               <label for="input-interval">ポーリング間隔 (秒)</label>
               <div class="range-container">
                 <input type="range" id="input-interval" min="10" max="300" step="5" value="60" />

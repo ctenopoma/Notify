@@ -16,6 +16,7 @@ let urlListContainer;
 let addUrlBtn;
 let inputInterval;
 let intervalVal;
+let inputHeartbeatName;
 let saveBtn;
 let toast;
 let toastMsg;
@@ -23,6 +24,7 @@ let toastMsg;
 // App State (Frontend Cache)
 let pollingTimer = null;
 let currentInterval = 60;
+let manualStatusUntil = 0; // suppress auto status overwrite while a manual sync message is shown
 
 // Show temporary toast notification
 function showToast(message, duration = 3000) {
@@ -220,6 +222,67 @@ function setStatus(state, text) {
   statusText.textContent = text;
 }
 
+// Render per-server connection badges in the settings screen,
+// based on whether the heartbeat (test) alert was actually received.
+function renderServerStatuses(statuses) {
+  const rows = urlListContainer.querySelectorAll('.url-input-row');
+  rows.forEach(row => {
+    const input = row.querySelector('.alertmanager-url-input');
+    const badge = row.querySelector('.server-status-badge');
+    if (!input || !badge) return;
+
+    const url = input.value.trim();
+    const status = statuses[url];
+
+    if (!status) {
+      badge.className = 'server-status-badge unknown';
+      badge.textContent = '未確認';
+      badge.title = '設定を保存すると接続状態を確認します';
+      return;
+    }
+
+    if (status.connected) {
+      badge.className = 'server-status-badge connected';
+      badge.textContent = '接続中';
+      const seen = status.last_heartbeat_at ? fnFormatRelativeTime(status.last_heartbeat_at) : 'たった今';
+      badge.title = `テストアラートを受信しました（${seen}）`;
+    } else if (status.reachable) {
+      badge.className = 'server-status-badge degraded';
+      badge.textContent = 'テスト未到達';
+      const lastSeen = status.last_heartbeat_at
+        ? `最終受信: ${fnFormatRelativeTime(status.last_heartbeat_at)}`
+        : '受信履歴なし';
+      badge.title = `APIへの接続は成功していますが、テストアラートが届いていません（${lastSeen}）。Alertmanager/Prometheusのルール設定を確認してください。`;
+    } else {
+      badge.className = 'server-status-badge disconnected';
+      badge.textContent = '未接続';
+      badge.title = status.last_error || '接続エラー';
+    }
+  });
+}
+
+// Compute and reflect an aggregate connection state in the header badge,
+// so "監視中" only shows once at least one server is verified connected.
+function updateOverallStatus(statuses) {
+  if (Date.now() < manualStatusUntil) return; // don't fight a just-triggered manual sync message
+
+  const entries = Object.values(statuses || {});
+  if (entries.length === 0) {
+    setStatus('idle', '監視中');
+    return;
+  }
+
+  const connectedCount = entries.filter(s => s.connected).length;
+
+  if (connectedCount === entries.length) {
+    setStatus('success', '監視中（接続確認済）');
+  } else if (connectedCount > 0) {
+    setStatus('warning', `一部未確認 (${connectedCount}/${entries.length})`);
+  } else {
+    setStatus('error', '未接続');
+  }
+}
+
 // Poll alerts from Rust cache
 async function fetchAlerts() {
   try {
@@ -229,6 +292,10 @@ async function fetchAlerts() {
 
     const errors = await invoke('get_connection_errors');
     renderConnectionErrors(errors);
+
+    const statuses = await invoke('get_server_statuses');
+    renderServerStatuses(statuses);
+    updateOverallStatus(statuses);
   } catch (e) {
     console.error('Failed to get active alerts:', e);
   }
@@ -236,24 +303,25 @@ async function fetchAlerts() {
 
 // Trigger immediate sync
 async function syncNow() {
+  manualStatusUntil = Date.now() + 1500;
   setStatus('polling', '同期中...');
   const syncIcon = syncBtn.querySelector('.sync-icon');
   syncIcon.classList.add('spinning');
-  
+
   try {
     await invoke('trigger_poll_now');
     // Wait briefly for rust loop to fetch and update state
     setTimeout(() => {
+      manualStatusUntil = 0;
       fetchAlerts();
-      setStatus('success', '同期完了');
-      setTimeout(() => setStatus('idle', '監視中'), 3000);
       syncIcon.classList.remove('spinning');
     }, 1500);
   } catch (e) {
     console.error('Manual sync failed:', e);
+    manualStatusUntil = Date.now() + 5000;
     setStatus('error', '同期エラー');
     showToast(`同期に失敗しました: ${e}`);
-    setTimeout(() => setStatus('idle', 'エラー監視中'), 5000);
+    setTimeout(() => { manualStatusUntil = 0; fetchAlerts(); }, 5000);
     syncIcon.classList.remove('spinning');
   }
 }
@@ -270,16 +338,22 @@ function createUrlRow(value = '') {
   input.value = value;
   input.required = true;
 
+  const statusBadge = document.createElement('span');
+  statusBadge.className = 'server-status-badge unknown';
+  statusBadge.textContent = '未確認';
+  statusBadge.title = '設定を保存すると接続状態を確認します';
+
   const removeBtn = document.createElement('button');
   removeBtn.type = 'button';
   removeBtn.className = 'btn icon-btn';
   removeBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
-  
+
   removeBtn.addEventListener('click', () => {
     row.remove();
   });
 
   row.appendChild(input);
+  row.appendChild(statusBadge);
   row.appendChild(removeBtn);
   return row;
 }
@@ -313,7 +387,8 @@ async function loadConfig() {
     inputInterval.value = config.polling_interval_secs;
     currentInterval = config.polling_interval_secs;
     intervalVal.textContent = `${currentInterval}秒`;
-    
+    inputHeartbeatName.value = config.heartbeat_alert_name || '';
+
     startPollingTimer();
   } catch (e) {
     console.error('Failed to load config:', e);
@@ -325,6 +400,7 @@ async function loadConfig() {
 async function saveConfig() {
   const urls = getUrlsFromUi();
   const interval = parseInt(inputInterval.value, 10);
+  const heartbeatAlertName = inputHeartbeatName.value.trim();
 
   if (urls.length === 0) {
     showToast('少なくとも1つのURLを入力してください。');
@@ -332,9 +408,9 @@ async function saveConfig() {
   }
 
   saveBtn.disabled = true;
-  
+
   try {
-    await invoke('save_config', { urls, interval });
+    await invoke('save_config', { urls, interval, heartbeatAlertName });
     currentInterval = interval;
     showToast('設定を保存しました。');
     
@@ -376,6 +452,7 @@ window.addEventListener('DOMContentLoaded', () => {
   addUrlBtn = document.getElementById('add-url-btn');
   inputInterval = document.getElementById('input-interval');
   intervalVal = document.getElementById('interval-val');
+  inputHeartbeatName = document.getElementById('input-heartbeat-name');
   saveBtn = document.getElementById('save-btn');
   toast = document.getElementById('toast');
   toastMsg = document.getElementById('toast-msg');

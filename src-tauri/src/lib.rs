@@ -7,10 +7,16 @@ use tauri::tray::TrayIconBuilder;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_autostart::MacosLauncher;
 
+fn default_heartbeat_alert_name() -> String {
+    "AlwaysFiringTest".to_string()
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct AppConfig {
     pub alertmanager_urls: Vec<String>,
     pub polling_interval_secs: u64,
+    #[serde(default = "default_heartbeat_alert_name")]
+    pub heartbeat_alert_name: String,
 }
 
 impl Default for AppConfig {
@@ -18,8 +24,20 @@ impl Default for AppConfig {
         Self {
             alertmanager_urls: vec!["http://localhost:9093".to_string()],
             polling_interval_secs: 60,
+            heartbeat_alert_name: default_heartbeat_alert_name(),
         }
     }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+pub struct ServerStatus {
+    pub url: String,
+    pub reachable: bool,
+    pub heartbeat_ok: bool,
+    pub connected: bool,
+    pub last_heartbeat_at: Option<String>,
+    pub last_error: Option<String>,
+    pub checked_at: String,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -66,6 +84,7 @@ pub struct AppState {
     pub config_changed_notify: Arc<tokio::sync::Notify>,
     pub connection_errors: Arc<RwLock<HashMap<String, String>>>,
     pub all_down_notified: Arc<RwLock<bool>>,
+    pub server_statuses: Arc<RwLock<HashMap<String, ServerStatus>>>,
 }
 
 #[tauri::command]
@@ -79,11 +98,13 @@ async fn save_config(
     state: tauri::State<'_, AppState>,
     urls: Vec<String>,
     interval: u64,
+    heartbeat_alert_name: String,
 ) -> Result<(), String> {
     {
         let mut config = state.config.write().await;
         config.alertmanager_urls = urls;
         config.polling_interval_secs = interval;
+        config.heartbeat_alert_name = heartbeat_alert_name;
 
         if let Ok(content) = serde_json::to_string_pretty(&*config) {
             if let Err(e) = std::fs::write(&state.config_path, content) {
@@ -105,6 +126,12 @@ async fn get_active_alerts(state: tauri::State<'_, AppState>) -> Result<Vec<Aler
 async fn get_connection_errors(state: tauri::State<'_, AppState>) -> Result<HashMap<String, String>, String> {
     let errors = state.connection_errors.read().await;
     Ok(errors.clone())
+}
+
+#[tauri::command]
+async fn get_server_statuses(state: tauri::State<'_, AppState>) -> Result<HashMap<String, ServerStatus>, String> {
+    let statuses = state.server_statuses.read().await;
+    Ok(statuses.clone())
 }
 
 #[tauri::command]
@@ -157,6 +184,13 @@ async fn create_silence(state: tauri::State<'_, AppState>, alertname: String, du
     Ok(())
 }
 
+fn alerts_contain_firing_heartbeat(alerts: &[Alert], heartbeat_alert_name: &str) -> bool {
+    alerts.iter().any(|alert| {
+        alert.status.state == "firing"
+            && alert.labels.get("alertname").map(|s| s.as_str()) == Some(heartbeat_alert_name)
+    })
+}
+
 fn update_tray_icon(app_handle: &tauri::AppHandle, has_error: bool) {
     if let Some(tray) = app_handle.tray_by_id("main") {
         if has_error {
@@ -175,6 +209,7 @@ fn update_tray_icon(app_handle: &tauri::AppHandle, has_error: bool) {
 
 async fn run_polling_cycle(
     urls: &[String],
+    heartbeat_alert_name: &str,
     app_handle: &tauri::AppHandle,
     state: &AppState,
 ) {
@@ -190,8 +225,13 @@ async fn run_polling_cycle(
         }
     };
 
+    let heartbeat_required = !heartbeat_alert_name.trim().is_empty();
+    let previous_statuses = state.server_statuses.read().await.clone();
+    let now_iso = chrono::Utc::now().to_rfc3339();
+
     let mut merged_firing_alerts = HashMap::new();
     let mut current_errors = HashMap::new();
+    let mut new_statuses: HashMap<String, ServerStatus> = HashMap::new();
     let total_urls = urls.len();
     let mut failed_urls = 0;
 
@@ -202,34 +242,74 @@ async fn run_polling_cycle(
         }
         let api_url = format!("{}/api/v2/alerts", clean_url);
 
+        let mut reachable = false;
+        let mut heartbeat_seen = false;
+        let mut last_error: Option<String> = None;
+        let mut last_heartbeat_at = previous_statuses
+            .get(base_url)
+            .and_then(|s| s.last_heartbeat_at.clone());
+
         match client.get(&api_url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    if let Ok(alerts) = resp.json::<Vec<Alert>>().await {
-                        for alert in alerts {
-                            if alert.status.state == "firing" {
-                                merged_firing_alerts.insert(alert.fingerprint.clone(), alert);
+                    match resp.json::<Vec<Alert>>().await {
+                        Ok(alerts) => {
+                            reachable = true;
+                            for alert in &alerts {
+                                if alert.status.state == "firing" {
+                                    merged_firing_alerts.insert(alert.fingerprint.clone(), alert.clone());
+                                }
+                            }
+                            heartbeat_seen = alerts_contain_firing_heartbeat(&alerts, heartbeat_alert_name);
+                            if heartbeat_seen {
+                                last_heartbeat_at = Some(now_iso.clone());
                             }
                         }
-                    } else {
-                        failed_urls += 1;
-                        current_errors.insert(base_url.clone(), "JSON Parsing Error".to_string());
+                        Err(_) => {
+                            failed_urls += 1;
+                            last_error = Some("JSON Parsing Error".to_string());
+                            current_errors.insert(base_url.clone(), "JSON Parsing Error".to_string());
+                        }
                     }
                 } else {
                     failed_urls += 1;
-                    current_errors.insert(base_url.clone(), format!("HTTP Error: {}", resp.status()));
+                    let msg = format!("HTTP Error: {}", resp.status());
+                    last_error = Some(msg.clone());
+                    current_errors.insert(base_url.clone(), msg);
                 }
             }
             Err(e) => {
                 failed_urls += 1;
-                current_errors.insert(base_url.clone(), format!("Connection Error: {}", e));
+                let msg = format!("Connection Error: {}", e);
+                last_error = Some(msg.clone());
+                current_errors.insert(base_url.clone(), msg);
             }
         }
+
+        let connected = reachable && (heartbeat_seen || !heartbeat_required);
+
+        new_statuses.insert(
+            base_url.clone(),
+            ServerStatus {
+                url: base_url.clone(),
+                reachable,
+                heartbeat_ok: heartbeat_seen,
+                connected,
+                last_heartbeat_at,
+                last_error,
+                checked_at: now_iso.clone(),
+            },
+        );
     }
 
     {
         let mut err_state = state.connection_errors.write().await;
         *err_state = current_errors;
+    }
+
+    {
+        let mut status_state = state.server_statuses.write().await;
+        *status_state = new_statuses;
     }
 
     let is_all_down = total_urls > 0 && failed_urls == total_urls;
@@ -336,6 +416,7 @@ pub fn run() {
                 config_changed_notify: Arc::new(tokio::sync::Notify::new()),
                 connection_errors: Arc::new(RwLock::new(HashMap::new())),
                 all_down_notified: Arc::new(RwLock::new(false)),
+                server_statuses: Arc::new(RwLock::new(HashMap::new())),
             };
 
             app.manage(state);
@@ -386,12 +467,12 @@ pub fn run() {
                 loop {
                     let app_state = app_handle.state::<AppState>();
                     
-                    let (urls, interval) = {
+                    let (urls, interval, heartbeat_alert_name) = {
                         let conf = app_state.config.read().await;
-                        (conf.alertmanager_urls.clone(), conf.polling_interval_secs)
+                        (conf.alertmanager_urls.clone(), conf.polling_interval_secs, conf.heartbeat_alert_name.clone())
                     };
 
-                    run_polling_cycle(&urls, &app_handle, &app_state).await;
+                    run_polling_cycle(&urls, &heartbeat_alert_name, &app_handle, &app_state).await;
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
@@ -413,10 +494,74 @@ pub fn run() {
             save_config,
             get_active_alerts,
             get_connection_errors,
+            get_server_statuses,
             trigger_poll_now,
             open_config_dir,
             create_silence
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert_with(alertname: &str, state: &str) -> Alert {
+        let mut labels = HashMap::new();
+        labels.insert("alertname".to_string(), alertname.to_string());
+        Alert {
+            fingerprint: format!("{}-{}", alertname, state),
+            status: AlertStatus { state: state.to_string() },
+            labels,
+            annotations: HashMap::new(),
+            starts_at: "2024-01-01T00:00:00Z".to_string(),
+            generator_url: None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_detected_when_firing_and_named_match() {
+        let alerts = vec![
+            alert_with("SomeOtherAlert", "firing"),
+            alert_with("AlwaysFiringTest", "firing"),
+        ];
+        assert!(alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn heartbeat_not_detected_when_absent() {
+        let alerts = vec![alert_with("SomeOtherAlert", "firing")];
+        assert!(!alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn heartbeat_not_detected_when_resolved() {
+        // A test alert that has stopped firing must not count as a live connection check.
+        let alerts = vec![alert_with("AlwaysFiringTest", "resolved")];
+        assert!(!alerts_contain_firing_heartbeat(&alerts, "AlwaysFiringTest"));
+    }
+
+    #[test]
+    fn heartbeat_check_is_disabled_by_empty_name() {
+        // Mirrors the `connected` computation in run_polling_cycle: an empty
+        // heartbeat name means the operator opted out, so reachability alone
+        // should be sufficient to mark a server as connected.
+        let heartbeat_alert_name = "";
+        let heartbeat_required = !heartbeat_alert_name.trim().is_empty();
+        let reachable = true;
+        let heartbeat_seen = false;
+        let connected = reachable && (heartbeat_seen || !heartbeat_required);
+        assert!(connected);
+    }
+
+    #[test]
+    fn reachable_without_heartbeat_is_not_connected_when_required() {
+        let heartbeat_alert_name = "AlwaysFiringTest";
+        let heartbeat_required = !heartbeat_alert_name.trim().is_empty();
+        let reachable = true;
+        let heartbeat_seen = false;
+        let connected = reachable && (heartbeat_seen || !heartbeat_required);
+        assert!(!connected);
+    }
 }
