@@ -274,3 +274,162 @@ sudo ufw status
 ```
 
 これで Ubuntu 上の Alertmanager 監視環境の準備は完了です。Tauriアプリの設定画面で `http://<UbuntuサーバーIP>:9093` を入力することで、常駐トレイからのアラート検知が開始されます。
+
+---
+
+## 6. コンテナ監視の強化（コンテナ停止検知・エラーログ検知）
+
+上記の基本構成では、Prometheus自身の死活監視（`InstanceDown`）しか行えず、以下の2点を検知できません。
+
+- 個々のDockerコンテナが落ちた／再起動した
+- コンテナの標準出力に出力されたエラーメッセージ
+
+これを検知できるように、`cAdvisor`（コンテナのメトリクス収集）と、Promtailの`docker_sd_configs`（コンテナログの自動収集）、Lokiの`Ruler`（ログベースのアラート評価）を追加します。
+
+### 6.1 `docker-compose.yml` の追加分
+`cadvisor` サービスを追加し、`promtail` にはDockerソケットのマウントを追加します（既存の `prometheus` / `alertmanager` / `loki` サービスは変更不要）。
+
+```yaml
+services:
+  # --- 既存の prometheus / alertmanager / loki はそのまま ---
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    volumes:
+      - ./config/promtail-config.yml:/etc/promtail/config.yml
+      - /var/log:/var/log
+      - /var/run/docker.sock:/var/run/docker.sock  # 追加: コンテナログ自動検出用
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+```
+
+### 6.2 `config/prometheus.yml` の追加分
+`scrape_configs` に cAdvisor のジョブを追加します。
+
+```yaml
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+```
+
+### 6.3 `config/alert.rules.yml` の追加分
+「最後にメトリクスが観測されてから一定時間経過」をコンテナ停止の検知条件にします（コンテナ側で個別に`/metrics`を出していなくても、cAdvisorが拾うため汎用的に使えます）。
+
+```yaml
+groups:
+  - name: container_rules
+    rules:
+      - alert: ContainerDown
+        expr: time() - container_last_seen > 60
+        labels:
+          severity: critical
+        annotations:
+          summary: "コンテナ [{{ $labels.name }}] が停止しています"
+          description: "コンテナ [{{ $labels.name }}] が60秒以上観測されていません（停止または再起動中の可能性があります）。"
+```
+
+既存の `test_rules` グループとは別グループとして、同じ `alert.rules.yml` 内に追記してください。
+
+### 6.4 `config/promtail-config.yml` の変更分
+ホストの syslog 収集に加えて、`docker_sd_configs` でDockerデーモンに問い合わせ、稼働中の全コンテナの標準出力ログを自動収集します。
+
+```yaml
+scrape_configs:
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: varlogs
+          __path__: /var/log/*log
+
+  - job_name: docker_containers
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+```
+
+これにより Loki 上のログに `container` ラベルが付き、`{container="alertmanager"}` のようにコンテナ単位で絞り込めるようになります。
+
+### 6.5 `config/loki-config.yml` の追加分とルールファイル
+`ruler.rule_path` を追記し、LogQLベースのアラートルールを置くディレクトリを指定します。
+
+```yaml
+ruler:
+  alertmanager_url: http://alertmanager:9093
+  rule_path: /etc/loki/rules
+  storage:
+    type: local
+    local:
+      directory: /etc/loki/rules
+```
+
+`docker-compose.yml` の `loki` サービスにルールファイル用のボリュームを追加します。
+
+```yaml
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    volumes:
+      - ./config/loki-config.yml:/etc/loki/local-config.yaml
+      - ./config/loki-rules:/etc/loki/rules  # 追加
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+```
+
+`config/loki-rules/fake/error-rules.yml`（テナント名 `fake` はLokiのデフォルト）にルールを作成します。
+
+```yaml
+groups:
+  - name: container_log_rules
+    rules:
+      - alert: ContainerErrorLog
+        expr: |
+          count_over_time({container=~".+"} |= "ERROR" [5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "コンテナ [{{ $labels.container }}] でエラーログを検知しました"
+          description: "直近5分間にERRORを含むログ行が出力されました。"
+```
+
+これにより Loki の Ruler がこのルールを定期評価し、条件に合致した場合は Alertmanager にアラートが送られます。以後は他のアラートと同様、Notifyアプリの `/api/v2/alerts` ポーリングで検知できます。
+
+### 6.6 動作確認
+
+```bash
+# cAdvisorが各コンテナのメトリクスを出力しているか
+curl http://localhost:8080/metrics | grep container_last_seen
+
+# Lokiのルーラーが正しくルールを読み込んでいるか
+curl http://localhost:3100/loki/api/v1/rules
+```
+
+`docker compose up -d` で再起動した後、いずれかのコンテナを `docker stop <name>` で止めると60秒前後で `ContainerDown` が、コンテナのログに `ERROR` を出力すると `ContainerErrorLog` が、それぞれ Alertmanager 経由でNotifyアプリに届くことを確認してください。
