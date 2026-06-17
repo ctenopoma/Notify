@@ -753,6 +753,61 @@ sudo ufw status
 | 温度は高いのにスロットリングが出ない | `DCGM_FI_DEV_THERMAL_VIOLATION` は累積カウンタ。`rate(...[5m]) > 0` で「いま絞られているか」を判定している。閾値手前の予兆は `GPUTemperatureHigh` で拾う。 |
 | Grafana にデータが出ない | データソース URL（`http://prometheus:9090` / `http://loki:3100`）は **compose 内のサービス名**で解決される。同じ `monitor` ネットワークにいるか確認。 |
 
+### 9.1 `dcgm-exporter` のログに `skipping ... (DCGM_FI_PROF_xxx): dcp metrics not enabled` と出る場合
+
+PROF 系（`DCGM_FI_PROF_*`）は DCGM の **DCP（プロファイリング）モジュール**経由で取得します。このログは DCP モジュールが有効化できておらず、PROF 系メトリクスだけが収集対象から外れている状態を示します（DEV 系のクロック・温度・FB などは通常そのまま出ます）。原因は主に次の5つです。上から順に確認してください。
+
+1. **`SYS_ADMIN` capability が無い**
+   プロファイリング系は `cap_add: SYS_ADMIN` が無いと DCP モジュールを初期化できません。4章の `docker-compose.yml` の `dcgm-exporter` サービスに `cap_add: [SYS_ADMIN]` が入っているか確認し、無ければ追加して再起動します。
+   ```bash
+   docker compose up -d --force-recreate dcgm-exporter
+   docker logs dcgm-exporter | grep -i -E 'profil|dcp'
+   ```
+
+2. **GPU がプロファイリング（DCP）非対応**
+   DCP はデータセンタ向け GPU（Tesla/Volta 以降の T4・V100・A100・H100・**H200** 等）が対象で、**GeForce/RTX などコンシューマ向け GPU は基本的に非対応**です。コンテナ内から確認できます。
+   ```bash
+   docker exec dcgm-exporter dcgmi discovery -l   # GPU 一覧とモデル名を確認
+   docker exec dcgm-exporter dcgmi profile --list  # 対応していなければエラーまたは空で返る
+   ```
+   非対応の GPU であれば PROF 系の収集は不可能なので、`dcgm-counters.csv` から `DCGM_FI_PROF_*` の行を削除し、DEV 系メトリクス（`DCGM_FI_DEV_GPU_UTIL` など）で代替してください。
+   **H200 自体は DCP に対応しているため、このケースには該当しません。**H200 では次の3・4を先に疑ってください。
+
+3. **MIG（Multi-Instance GPU）構成によりプロファイリングが使えない**
+   MIG を有効化している場合、GPU インスタンスの分割サイズによってはプロファイリングが提供されません。`dcgmi discovery -c` で MIG 構成を確認し、必要であれば該当 GPU を MIG 無効（フルGPU）に戻すか、対応プロファイルに変更してください。
+   ```bash
+   nvidia-smi -q -d MIG | grep "MIG Mode"   # ホスト側で MIG が Disabled か確認
+   ```
+
+4. **（H200 / NVSwitch 構成）NVIDIA Fabric Manager が起動していない**
+   **H200 を含む NVSwitch 搭載のマルチGPUサーバー（HGX 系の8GPU構成など）では、ホスト側で `nv-fabricmanager` デーモンが必須**です。これが起動していないと NVSwitch ファブリックが初期化されず、DCGM の Profiling モジュール自体が読み込めずに PROF 系が丸ごと skip されることがあります。コンテナの `cap_add: SYS_ADMIN` とは別物（ホスト側のサービス）なので、まずホストで確認してください。
+   ```bash
+   systemctl status nvidia-fabricmanager     # ホスト上で active (running) か確認
+   nvidia-smi -q | grep -A2 "Fabric"         # State が "Completed" になっているか確認
+   ```
+   未導入の場合は、ドライバと同バージョンの `nvidia-fabricmanager` パッケージをホストに入れて起動してください（単体の H200 で NVLink/NVSwitch を使わない構成では対象外です）。
+
+5. **イメージ内にプロファイリング用ライブラリ（`libdcgmmoduleprofiling.so.4`）が同梱されていない**
+   Docker Hub の `nvidia/dcgm-exporter` イメージは、ビルド時に `datacenter-gpu-manager-4-core` を `--no-install-recommends` でインストールしており、推奨パッケージ扱いの `datacenter-gpu-manager-4-proprietary`（プロファイリングモジュール本体）が一部のビルドで欠落していたことが報告されています（[NVIDIA/dcgm-exporter#449](https://github.com/NVIDIA/dcgm-exporter/issues/449)、PR #456 で修正）。`cap_add: SYS_ADMIN` あり・GPU は DCP 対応・MIG 無効・NVSwitch なし（Fabric Manager 不要）の条件を満たしていても `DCP metrics not enabled` が出る場合は、まずこれを疑ってください。
+   ```bash
+   # コンテナ内にプロファイリングモジュールの .so が存在するか確認
+   docker exec dcgm-exporter find / -iname "*moduleprofiling*" 2>/dev/null
+   # 何も出力されなければ欠落が濃厚
+   ```
+   対処は次のいずれかです。
+   ```bash
+   # A: イメージを強制再取得して修正済みビルドに更新
+   docker compose pull dcgm-exporter
+   docker compose up -d --force-recreate dcgm-exporter
+
+   # B（より確実）: NVIDIA NGC の公式イメージに切り替える
+   #   docker-compose.yml の dcgm-exporter.image を変更
+   #   image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04
+   docker compose up -d --force-recreate dcgm-exporter
+   ```
+
+> 上記のいずれにも該当しないにもかかわらず解決しない場合は、ホストの NVIDIA ドライバと `dcgm-exporter` イメージ内の DCGM ライブラリのバージョン不整合が疑われます。H200 は比較的新しい GPU のため、古い `dcgm-exporter` イメージタグや古いドライバでは Profiling モジュールが対応していないことがあります。`nvidia-smi` のドライババージョンと、`docker exec dcgm-exporter dcgmi -v` のバージョンを確認し、`dcgm-exporter` を最新タグ（または使用ドライバに対応したタグ）に更新してください。
+
 ---
 
 ## 10. 監視対象・しきい値の追加・変更
