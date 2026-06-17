@@ -29,9 +29,12 @@ from pydantic import BaseModel
 import catalog
 import generator
 
-MONITOR_DIR = Path(os.environ.get("MONITOR_DIR", "/opt/monitor"))
+MONITOR_DIR = Path(os.environ.get("MONITOR_DIR", "/opt/monitor"))   # in-container config root
+# Host path of the monitor dir, used as `docker compose --project-directory` so the
+# daemon resolves ./config bind mounts against the real host filesystem.
+HOST_MONITOR_DIR = os.environ.get("HOST_MONITOR_DIR", str(MONITOR_DIR))
 CONFIG_DIR = MONITOR_DIR / "config"
-COMPOSE_FILE = MONITOR_DIR / "docker-compose.yml"
+COMPOSE_FILE = MONITOR_DIR / "docker-compose.yml"   # container-readable path passed to -f
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Stack services we manage (for the compose/service controls).
@@ -64,7 +67,8 @@ def run(cmd: list[str], timeout: int = 120) -> dict:
 
 
 def compose(args: list[str], timeout: int = 300) -> dict:
-    return run(["docker", "compose", "-f", str(COMPOSE_FILE)] + args, timeout=timeout)
+    return run(["docker", "compose", "--project-directory", HOST_MONITOR_DIR,
+                "-f", str(COMPOSE_FILE)] + args, timeout=timeout)
 
 
 def http_get(url: str, timeout: float = 2.0) -> str | None:
@@ -114,7 +118,7 @@ def put_state(body: StatePut):
 @app.get("/api/preview")
 def preview():
     """Render all files in-memory from current saved state (no disk writes)."""
-    return generator.render_all(load_state())
+    return generator.render_all(load_state(), MONITOR_DIR)
 
 
 # ---------------------------------------------------------------------------
