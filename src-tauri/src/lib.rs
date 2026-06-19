@@ -11,22 +11,85 @@ fn default_heartbeat_alert_name() -> String {
     "AlwaysFiringTest".to_string()
 }
 
+// Grafana's unified-alerting Alertmanager is reached under this prefix; appending
+// `/api/v2/alerts` or `/api/v2/silences` yields the standard Alertmanager v2 API.
+const GRAFANA_AM_PREFIX: &str = "/api/alertmanager/grafana";
+
+fn alerts_endpoint(base_url: &str) -> String {
+    format!("{}{}/api/v2/alerts", base_url.trim_end_matches('/'), GRAFANA_AM_PREFIX)
+}
+
+fn silences_endpoint(base_url: &str) -> String {
+    format!("{}{}/api/v2/silences", base_url.trim_end_matches('/'), GRAFANA_AM_PREFIX)
+}
+
+// One monitored Grafana instance. Each server carries its OWN service-account
+// token, because separate Grafana instances issue independent tokens — a single
+// shared token could not authenticate against all of them.
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug, Default)]
+pub struct GrafanaServer {
+    pub url: String,
+    #[serde(default)]
+    pub token: String,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct AppConfig {
-    pub alertmanager_urls: Vec<String>,
+    #[serde(default)]
+    pub servers: Vec<GrafanaServer>,
     pub polling_interval_secs: u64,
     #[serde(default = "default_heartbeat_alert_name")]
     pub heartbeat_alert_name: String,
+
+    // --- Legacy fields, read only to migrate older config.json files. They are
+    // never written back (skip_serializing); `normalize()` folds them into
+    // `servers` on load. Covers both the Alertmanager era (alertmanager_urls)
+    // and the single-global-token era (grafana_urls + grafana_token).
+    #[serde(default, alias = "grafana_urls", alias = "alertmanager_urls", skip_serializing)]
+    legacy_urls: Vec<String>,
+    #[serde(default, rename = "grafana_token", skip_serializing)]
+    legacy_token: String,
+}
+
+impl AppConfig {
+    // Fold any legacy url/token fields into `servers` so the rest of the app only
+    // ever deals with the per-server shape.
+    fn normalize(&mut self) {
+        if self.servers.is_empty() && !self.legacy_urls.is_empty() {
+            self.servers = self
+                .legacy_urls
+                .drain(..)
+                .map(|url| GrafanaServer { url, token: self.legacy_token.clone() })
+                .collect();
+        }
+        self.legacy_urls.clear();
+        self.legacy_token.clear();
+    }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            alertmanager_urls: vec!["http://localhost:9093".to_string()],
+            servers: vec![GrafanaServer {
+                url: "http://localhost:3000".to_string(),
+                token: String::new(),
+            }],
             polling_interval_secs: 60,
             heartbeat_alert_name: default_heartbeat_alert_name(),
+            legacy_urls: Vec::new(),
+            legacy_token: String::new(),
         }
     }
+}
+
+// Read + normalize config.json from disk. Returns None (rather than a default)
+// when the file is missing or mid-write/unparsable, so callers can keep the
+// last-known-good config instead of momentarily snapping back to defaults.
+fn read_config_file(path: &std::path::Path) -> Option<AppConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut cfg: AppConfig = serde_json::from_str(&content).ok()?;
+    cfg.normalize();
+    Some(cfg)
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -62,6 +125,12 @@ pub struct Alert {
     pub starts_at: String,
     #[serde(rename = "generatorURL")]
     pub generator_url: Option<String>,
+    // Not part of the Alertmanager payload: we stamp this with the base URL of the
+    // Grafana instance the alert came from, so the UI can build a link to that
+    // instance's alert-rule detail page (the merge step otherwise loses which
+    // server an alert originated from).
+    #[serde(default, rename = "sourceURL")]
+    pub source_url: Option<String>,
 }
 
 // Deserialize the /api/v2/alerts array element-by-element so that one
@@ -116,6 +185,10 @@ pub struct AppState {
 
 #[tauri::command]
 async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, String> {
+    // Pick up any out-of-band edits to config.json when the settings screen opens.
+    if let Some(fresh) = read_config_file(&state.config_path) {
+        *state.config.write().await = fresh;
+    }
     let config = state.config.read().await;
     Ok(config.clone())
 }
@@ -123,13 +196,13 @@ async fn get_config(state: tauri::State<'_, AppState>) -> Result<AppConfig, Stri
 #[tauri::command]
 async fn save_config(
     state: tauri::State<'_, AppState>,
-    urls: Vec<String>,
+    servers: Vec<GrafanaServer>,
     interval: u64,
     heartbeat_alert_name: String,
 ) -> Result<(), String> {
     {
         let mut config = state.config.write().await;
-        config.alertmanager_urls = urls;
+        config.servers = servers;
         config.polling_interval_secs = interval;
         config.heartbeat_alert_name = heartbeat_alert_name;
 
@@ -179,8 +252,8 @@ async fn open_config_dir(state: tauri::State<'_, AppState>, app_handle: tauri::A
 
 #[tauri::command]
 async fn create_silence(state: tauri::State<'_, AppState>, alertname: String, duration_hours: u64) -> Result<(), String> {
-    let urls = state.config.read().await.alertmanager_urls.clone();
-    
+    let servers = state.config.read().await.servers.clone();
+
     let now = chrono::Utc::now();
     let ends_at = now + chrono::Duration::hours(duration_hours as i64);
     
@@ -198,12 +271,17 @@ async fn create_silence(state: tauri::State<'_, AppState>, alertname: String, du
     };
 
     let client = reqwest::Client::builder().no_proxy().build().map_err(|e| e.to_string())?;
-    
-    for base_url in urls {
-        let clean_url = base_url.trim_end_matches('/');
-        let api_url = format!("{}/api/v2/silences", clean_url);
+
+    for server in servers {
+        if server.url.trim().is_empty() {
+            continue;
+        }
+        let mut req = client.post(silences_endpoint(&server.url)).json(&payload);
+        if !server.token.trim().is_empty() {
+            req = req.bearer_auth(&server.token);
+        }
         // Fire and forget
-        let _ = client.post(&api_url).json(&payload).send().await;
+        let _ = req.send().await;
     }
     
     // Trigger poll to fetch updated alerts
@@ -243,7 +321,7 @@ fn update_tray_icon(app_handle: &tauri::AppHandle, has_error: bool) {
 }
 
 async fn run_polling_cycle(
-    urls: &[String],
+    servers: &[GrafanaServer],
     heartbeat_alert_name: &str,
     app_handle: &tauri::AppHandle,
     state: &AppState,
@@ -267,15 +345,16 @@ async fn run_polling_cycle(
     let mut merged_firing_alerts = HashMap::new();
     let mut current_errors = HashMap::new();
     let mut new_statuses: HashMap<String, ServerStatus> = HashMap::new();
-    let total_urls = urls.len();
+    let total_urls = servers.len();
     let mut failed_urls = 0;
 
-    for base_url in urls {
+    for server in servers {
+        let base_url = &server.url;
         let clean_url = base_url.trim_end_matches('/');
         if clean_url.is_empty() {
             continue;
         }
-        let api_url = format!("{}/api/v2/alerts", clean_url);
+        let api_url = alerts_endpoint(clean_url);
 
         let mut reachable = false;
         let mut heartbeat_seen = false;
@@ -284,7 +363,11 @@ async fn run_polling_cycle(
             .get(base_url)
             .and_then(|s| s.last_heartbeat_at.clone());
 
-        match client.get(&api_url).send().await {
+        let mut request = client.get(&api_url);
+        if !server.token.trim().is_empty() {
+            request = request.bearer_auth(&server.token);
+        }
+        match request.send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     match resp.text().await.map_err(|e| e.to_string())
@@ -296,7 +379,9 @@ async fn run_polling_cycle(
                                 if alert.status.state == "active"
                                     && !is_heartbeat_alert(alert, heartbeat_alert_name)
                                 {
-                                    merged_firing_alerts.insert(alert.fingerprint.clone(), alert.clone());
+                                    let mut alert = alert.clone();
+                                    alert.source_url = Some(clean_url.to_string());
+                                    merged_firing_alerts.insert(alert.fingerprint.clone(), alert);
                                 }
                             }
                             heartbeat_seen = alerts_contain_firing_heartbeat(&alerts, heartbeat_alert_name);
@@ -357,14 +442,14 @@ async fn run_polling_cycle(
         let _ = app_handle.notification()
             .builder()
             .title("[CRITICAL] Connection Lost")
-            .body("Failed to connect to all registered Alertmanager instances.")
+            .body("Failed to connect to all registered Grafana instances.")
             .show();
         *all_down_flag = true;
     } else if !is_all_down && *all_down_flag {
         let _ = app_handle.notification()
             .builder()
             .title("[RECOVERED] Connection Restored")
-            .body("Successfully reconnected to Alertmanager.")
+            .body("Successfully reconnected to Grafana.")
             .show();
         *all_down_flag = false;
     }
@@ -433,7 +518,7 @@ pub fn run() {
             let _ = std::fs::create_dir_all(&config_dir);
             let config_path = config_dir.join("config.json");
 
-            let config = if config_path.exists() {
+            let mut config = if config_path.exists() {
                 if let Ok(file_content) = std::fs::read_to_string(&config_path) {
                     serde_json::from_str(&file_content).unwrap_or_default()
                 } else {
@@ -446,6 +531,9 @@ pub fn run() {
                 }
                 default_config
             };
+            // Migrate any legacy alertmanager_urls / grafana_urls+grafana_token
+            // shape into the per-server list before anything reads it.
+            config.normalize();
 
             let state = AppState {
                 config: Arc::new(RwLock::new(config)),
@@ -509,13 +597,19 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 loop {
                     let app_state = app_handle.state::<AppState>();
-                    
-                    let (urls, interval, heartbeat_alert_name) = {
+
+                    // Re-read config.json from disk each cycle so external edits
+                    // (or a hand-fixed URL/token) take effect without a restart.
+                    if let Some(fresh) = read_config_file(&app_state.config_path) {
+                        *app_state.config.write().await = fresh;
+                    }
+
+                    let (servers, interval, heartbeat_alert_name) = {
                         let conf = app_state.config.read().await;
-                        (conf.alertmanager_urls.clone(), conf.polling_interval_secs, conf.heartbeat_alert_name.clone())
+                        (conf.servers.clone(), conf.polling_interval_secs, conf.heartbeat_alert_name.clone())
                     };
 
-                    run_polling_cycle(&urls, &heartbeat_alert_name, &app_handle, &app_state).await;
+                    run_polling_cycle(&servers, &heartbeat_alert_name, &app_handle, &app_state).await;
 
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
@@ -560,6 +654,7 @@ mod tests {
             annotations: HashMap::new(),
             starts_at: "2024-01-01T00:00:00Z".to_string(),
             generator_url: None,
+            source_url: None,
         }
     }
 

@@ -683,10 +683,17 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .url-input-row input {
   flex-grow: 1;
+}
+
+/* Token sits on its own line under the URL (the window is too narrow to fit
+   URL + token + badge + delete on a single row). */
+.url-input-row .grafana-token-input {
+  flex-basis: 100%;
 }
 
 .server-status-badge {

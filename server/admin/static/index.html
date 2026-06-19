@@ -45,8 +45,8 @@
     <!-- 監視対象 -------------------------------------------------------- -->
     <section id="targets" class="tab">
       <h2>監視対象コンテナ</h2>
-      <p class="hint">死活（/metrics スクレイプ）・cAdvisor 死活・エラーログ収集の対象をコンテナ単位で指定します。
-        対象を増減すると prometheus.yml / alert.rules.yml / promtail-config.yml / Loki ルールが自動で更新されます。</p>
+      <p class="hint">死活（/metrics スクレイプ）・cAdvisor 死活の対象をコンテナ単位で指定します。
+        対象を増減すると prometheus.yml と Grafana アラートルールが自動で更新されます。</p>
       <div class="row">
         <button id="btn-add-container">手動で追加</button>
         <select id="discover-add"><option value="">検出から追加…</option></select>
@@ -98,10 +98,6 @@
           <input type="text" id="prom-size" placeholder="0" />
           <small>例: 50GB。"0" で無制限（時間のみで制御）。</small>
         </label>
-        <label>Loki ログ保持期間
-          <input type="text" id="loki-period" placeholder="168h" />
-          <small>Go duration。168h = 7日。compactor が自動削除。</small>
-        </label>
         <label>コンテナログ 1ファイル最大サイズ
           <input type="text" id="log-max-size" placeholder="10m" />
           <small>ターミナル出力(stdout/stderr)のローテーション単位。</small>
@@ -112,7 +108,7 @@
         </label>
       </div>
       <p class="hint">⚠ ログローテーション(<code>LOG_MAX_*</code>)はサービスの再生成が必要です。「操作」タブの
-        「再生成 (recreate)」を実行してください。Prometheus/Loki の保持は再起動で反映されます。</p>
+        「再生成 (recreate)」を実行してください。Prometheus の保持は再起動で反映されます。</p>
     </section>
 
     <!-- 操作/プレビュー ------------------------------------------------- -->

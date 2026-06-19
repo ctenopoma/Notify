@@ -1,4 +1,23 @@
-# vLLM / LiteLLM コンテナ & GPU 監視基盤 セットアップ手順（Prometheus / Loki / Grafana / Alertmanager + Notify）
+# vLLM / LiteLLM コンテナ & GPU 監視基盤 セットアップ手順（Prometheus / Grafana + Notify）
+
+> ## ⚠️ アーキテクチャ変更のお知らせ（重要）
+>
+> 現行の実装では **Loki / promtail / 独立 Alertmanager を廃止**し、アラートは
+> **Grafana ユニファイドアラート**に一本化しました。要点:
+>
+> - **アラート評価とルーティングは Grafana** が担います。Grafana が Prometheus
+>   データソースに対してルールを評価し、**内蔵 Alertmanager**
+>   （`/api/alertmanager/grafana/api/v2/...`）で発火中アラートを公開します。
+> - **Notify アプリは Grafana（`:3000`）をポーリング**します。接続には Grafana の
+>   **サービスアカウントトークン**が必要です（旧来の `:9093` 無認証ポーリングは廃止）。
+>   設定手順は [`client_setup_guide.md`](./client_setup_guide.md) §3 を参照。
+> - **ログ監視（エラーログ由来のアラート）は廃止**しました。監視はメトリクスのみです。
+>   アラートルールは `monitor-config.json` から
+>   `grafana/provisioning/alerting/rules.yml` として自動生成されます。
+> - 実際に動く構成と運用は [`server/README.md`](../server/README.md) が最新です。
+>
+> 以下 §3〜§5・§7〜§8 には Loki / promtail / Alertmanager を含む**旧構成の記述**が
+> 残っています（仕組みの理解・移行前の参照用）。現行スタックとは一致しません。
 
 本ドキュメントは、Ubuntu サーバー上の Docker 環境で動く **特定のコンテナ（例: vLLM と LiteLLM）** と、それらが載る **サーバーの GPU** を対象に、
 
@@ -719,9 +738,10 @@ nvidia-smi -l 1      # 別端末で温度・使用率の上昇をリアルタイ
 ## 7. Notify アプリ側の設定
 
 1. Notify の「設定」タブを開く。
-2. **Alertmanager API URL** に `http://<UbuntuサーバーIP>:9093` を入力（複数の Alertmanager があれば「URLを追加」で並列監視・重複排除）。
-3. **テスト用アラート名（ハートビート）** が `AlwaysFiringTest` になっていることを確認（5.3 のルール名と一致させる）。
-4. 「設定を保存」。各サーバーの状態が「接続中」になれば、`/metrics` 死活・cAdvisor 死活・ログ検知・**GPU 閾値超過**の各アラートがそのまま Notify に届きます。
+2. **Grafana URLs** に `http://<UbuntuサーバーIP>:3000` を入力（複数の Grafana があれば「URLを追加」で並列監視・重複排除）。パスは不要で、アプリが `/api/alertmanager/grafana/api/v2/...` を補完します。
+3. 同じ行の**トークン欄**に、その Grafana で発行した `glsa_...` トークンを入力（トークンは URL 行ごとにペア。発行手順は [`client_setup_guide.md`](./client_setup_guide.md) §3）。
+4. **テスト用アラート名（ハートビート）** が `AlwaysFiringTest` になっていることを確認（Grafana 側の常時発火ルール名と一致させる）。
+5. 「設定を保存」。各サーバーの状態が「接続中」になれば、`/metrics` 死活・cAdvisor 死活・**GPU 閾値超過**の各アラートがそのまま Notify に届きます。
 
 > **役割分担の整理**：日々の GPU 負荷の「傾向」は **Grafana** で眺め、「閾値を超えた異常」だけが **Notify** にプッシュされます。Grafana を常時開いておく必要はなく、Notify の通知を起点に Grafana を開いて原因を深掘りする運用が基本です。
 
@@ -729,19 +749,17 @@ nvidia-smi -l 1      # 別端末で温度・使用率の上昇をリアルタイ
 
 ## 8. ファイアウォール (UFW)
 
-Notify が動く Windows PC から Alertmanager のポート `9093` へ、ダッシュボードを見る PC から Grafana のポート `3000` へアクセスを許可します。
+Notify が動く Windows PC、およびダッシュボードを見る PC から Grafana のポート `3000` へアクセスを許可します（Notify もダッシュボード閲覧も同じ Grafana ポートを使います）。
 
 ```bash
-# Notify 用（Alertmanager API）
-sudo ufw allow from 192.168.1.50 to any port 9093 proto tcp
-# Grafana 閲覧用
+# Notify / ダッシュボード閲覧（どちらも Grafana :3000）
 sudo ufw allow from 192.168.1.0/24 to any port 3000 proto tcp
 
 sudo ufw enable
 sudo ufw status
 ```
 
-> Prometheus(9090) / DCGM(9400) / Loki(3100) / cAdvisor(8080) は基本的に**監視スタック内部からの参照のみ**で十分です。外部から直接見る必要がなければ、ファイアウォールで開けないでください（必要な場合のみ管理 PC に限定して許可）。
+> Prometheus(9090) / DCGM(9400) / cAdvisor(8080) は基本的に**監視スタック内部からの参照のみ**で十分です。外部から直接見る必要がなければ、ファイアウォールで開けないでください（必要な場合のみ管理 PC に限定して許可）。
 
 ---
 

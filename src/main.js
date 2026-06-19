@@ -135,10 +135,24 @@ function renderAlerts(alerts) {
     const summary = alert.annotations.summary || alert.annotations.description || '詳細情報はありません。';
     const relativeTime = fnFormatRelativeTime(alert.startsAt);
     
+    // Prefer the Grafana alert-rule detail page (a recognizable screen that
+    // shows what this alert is) over the raw generatorURL, which points at the
+    // underlying datasource query and is confusing. Grafana stamps each managed
+    // alert with the `__alert_rule_uid__` label; combined with the source server
+    // URL we can link straight to /alerting/grafana/<uid>/view. Fall back to the
+    // generatorURL when either piece is missing.
+    const ruleUid = alert.labels.__alert_rule_uid__;
+    let sourceLink = '';
+    if (alert.sourceURL && ruleUid) {
+      sourceLink = `${alert.sourceURL.replace(/\/+$/, '')}/alerting/grafana/${encodeURIComponent(ruleUid)}/view`;
+    } else if (alert.generatorURL) {
+      sourceLink = alert.generatorURL;
+    }
+
     let actionBtnHtml = '';
-    if (alert.generatorURL) {
+    if (sourceLink) {
       actionBtnHtml = `
-        <a href="${alert.generatorURL}" target="_blank" class="alert-action-btn">
+        <a href="${sourceLink}" target="_blank" class="alert-action-btn">
           ソース表示
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/>
@@ -155,7 +169,9 @@ function renderAlerts(alerts) {
 
     let labelPillsHtml = '';
     Object.entries(alert.labels).forEach(([key, val]) => {
-      if (key !== 'alertname' && key !== 'severity') {
+      // Skip alertname/severity (shown elsewhere) and Grafana's internal
+      // __double_underscore__ labels (e.g. __alert_rule_uid__), which are noise.
+      if (key !== 'alertname' && key !== 'severity' && !key.startsWith('__')) {
         labelPillsHtml += `<span class="label-pill">${key}=${val}</span>`;
       }
     });
@@ -277,7 +293,7 @@ function renderServerStatuses(statuses) {
       const lastSeen = status.last_heartbeat_at
         ? `最終受信: ${fnFormatRelativeTime(status.last_heartbeat_at)}`
         : '受信履歴なし';
-      badge.title = `APIへの接続は成功していますが、テストアラートが届いていません（${lastSeen}）。Alertmanager/Prometheusのルール設定を確認してください。`;
+      badge.title = `APIへの接続は成功していますが、テストアラートが届いていません（${lastSeen}）。Grafanaのアラートルール設定を確認してください。`;
     } else {
       badge.className = 'server-status-badge disconnected';
       badge.textContent = '未接続';
@@ -351,17 +367,26 @@ async function syncNow() {
   }
 }
 
-// URL Inputs Management
-function createUrlRow(value = '') {
+// URL + token Inputs Management. Each row pairs a Grafana base URL with the
+// service-account token issued by THAT Grafana, so multiple distinct servers
+// can each authenticate with their own token.
+function createUrlRow(url = '', token = '') {
   const row = document.createElement('div');
   row.className = 'url-input-row';
-  
+
   const input = document.createElement('input');
   input.type = 'url';
   input.className = 'alertmanager-url-input';
-  input.placeholder = 'http://192.168.1.100:9093';
-  input.value = value;
+  input.placeholder = 'http://192.168.1.100:3000';
+  input.value = url;
   input.required = true;
+
+  const tokenInput = document.createElement('input');
+  tokenInput.type = 'password';
+  tokenInput.className = 'grafana-token-input';
+  tokenInput.placeholder = 'glsa_... (このGrafanaのSAトークン)';
+  tokenInput.value = token;
+  tokenInput.autocomplete = 'off';
 
   const statusBadge = document.createElement('span');
   statusBadge.className = 'server-status-badge unknown';
@@ -378,37 +403,39 @@ function createUrlRow(value = '') {
   });
 
   row.appendChild(input);
+  row.appendChild(tokenInput);
   row.appendChild(statusBadge);
   row.appendChild(removeBtn);
   return row;
 }
 
-function renderUrlInputs(urls) {
+function renderUrlInputs(servers) {
   urlListContainer.innerHTML = '';
-  if (!urls || urls.length === 0) {
+  if (!servers || servers.length === 0) {
     urlListContainer.appendChild(createUrlRow());
     return;
   }
-  urls.forEach(url => {
-    urlListContainer.appendChild(createUrlRow(url));
+  servers.forEach(s => {
+    urlListContainer.appendChild(createUrlRow(s.url || '', s.token || ''));
   });
 }
 
-function getUrlsFromUi() {
-  const inputs = document.querySelectorAll('.alertmanager-url-input');
-  const urls = [];
-  inputs.forEach(input => {
-    const val = input.value.trim();
-    if (val) urls.push(val);
+function getServersFromUi() {
+  const rows = urlListContainer.querySelectorAll('.url-input-row');
+  const servers = [];
+  rows.forEach(row => {
+    const url = row.querySelector('.alertmanager-url-input').value.trim();
+    const token = row.querySelector('.grafana-token-input').value.trim();
+    if (url) servers.push({ url, token });
   });
-  return urls;
+  return servers;
 }
 
 // Load Application Configuration
 async function loadConfig() {
   try {
     const config = await invoke('get_config');
-    renderUrlInputs(config.alertmanager_urls);
+    renderUrlInputs(config.servers);
     inputInterval.value = config.polling_interval_secs;
     currentInterval = config.polling_interval_secs;
     intervalVal.textContent = `${currentInterval}秒`;
@@ -423,11 +450,11 @@ async function loadConfig() {
 
 // Save Configuration
 async function saveConfig() {
-  const urls = getUrlsFromUi();
+  const servers = getServersFromUi();
   const interval = parseInt(inputInterval.value, 10);
   const heartbeatAlertName = inputHeartbeatName.value.trim();
 
-  if (urls.length === 0) {
+  if (servers.length === 0) {
     showToast('少なくとも1つのURLを入力してください。');
     return;
   }
@@ -435,7 +462,7 @@ async function saveConfig() {
   saveBtn.disabled = true;
 
   try {
-    await invoke('save_config', { urls, interval, heartbeatAlertName });
+    await invoke('save_config', { servers, interval, heartbeatAlertName });
     currentInterval = interval;
     showToast('設定を保存しました。');
     

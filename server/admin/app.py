@@ -39,11 +39,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 # Stack services we manage (for the compose/service controls).
 STACK_SERVICES = [
-    "prometheus", "alertmanager", "grafana", "dcgm-exporter",
-    "node-exporter", "loki", "promtail", "cadvisor", "admin",
+    "prometheus", "grafana", "dcgm-exporter",
+    "node-exporter", "cadvisor", "admin",
 ]
-# Changing these files only needs a Prometheus reload, not a restart.
-RELOAD_ONLY = {"prometheus.yml", "alert.rules.yml"}
+# Changing this file only needs a Prometheus reload, not a restart.
+RELOAD_ONLY = {"prometheus.yml"}
 
 app = FastAPI(title="Notify Monitoring Admin")
 
@@ -250,15 +250,13 @@ def apply():
     written = generator.write_all(state, CONFIG_DIR, MONITOR_DIR)
 
     steps = []
-    # 1) Prometheus: hot-reload via POST (no restart needed for prometheus.yml/alerts).
+    # 1) Prometheus: hot-reload via POST (no restart needed for prometheus.yml).
     steps.append(_post("http://prometheus:9090/-/reload", "prometheus reload"))
 
-    # 2) Loki ruler picks up rule files via its API reload.
-    steps.append(_post("http://loki:3100/loki/api/v1/rules", "loki rules check", method="GET"))
-
-    # 3) Restart services whose *config files* changed and have no hot reload.
-    restart = compose(["restart", "promtail", "loki", "dcgm-exporter"])
-    steps.append({"step": "restart promtail/loki/dcgm", **restart})
+    # 2) Grafana picks up changed alert-rule provisioning on restart (there is no
+    #    hot-reload endpoint for file-based alerting provisioning).
+    restart = compose(["restart", "grafana", "dcgm-exporter"])
+    steps.append({"step": "restart grafana/dcgm", **restart})
 
     return {"ok": all(s.get("ok", True) for s in steps), "written": written, "steps": steps}
 

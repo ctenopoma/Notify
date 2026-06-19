@@ -4,10 +4,8 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
+    # Fixed UID so the auto-generated alert rules (provisioning/alerting/rules.yml)
+    # can reference this datasource deterministically.
+    uid: prometheus
     url: http://prometheus:9090
     isDefault: true
-
-  - name: Loki
-    type: loki
-    access: proxy
-    url: http://loki:3100

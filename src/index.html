@@ -20,7 +20,7 @@
             <path d="M12 22C13.1 22 14 21.1 14 20H10C10 21.1 10.9 22 12 22ZM18 16V11C18 7.93 16.36 5.36 13.5 4.68V4C13.5 3.17 12.83 2.5 12 2.5C11.17 2.5 10.5 3.17 10.5 4V4.68C7.63 5.36 6 7.92 6 11V16L4 18V19H20V18L18 16ZM16 17H8V11C8 8.52 9.51 6.5 12 6.5C14.49 6.5 16 8.52 16 11V17Z" fill="currentColor"/>
           </svg>
           <span class="app-title">Notify</span>
-          <span class="app-subtitle">Alertmanager Client</span>
+          <span class="app-subtitle">Grafana Alert Client</span>
         </div>
         
         <div class="header-controls">
@@ -60,7 +60,7 @@
               </svg>
             </div>
             <h3>発火中のアラートはありません</h3>
-            <p>システムは正常に動作しています。接続先の Alertmanager を監視中です。</p>
+            <p>システムは正常に動作しています。接続先の Grafana を監視中です。</p>
           </div>
 
           <!-- アラートカードコンテナ -->
@@ -73,7 +73,7 @@
             <h2 class="section-title">接続設定</h2>
             
             <div class="form-group">
-              <label>Alertmanager API URLs</label>
+              <label>Grafana URLs</label>
               <div id="url-list-container" class="url-list-container">
                 <!-- Dynamic URL inputs will be added here -->
               </div>
@@ -81,7 +81,7 @@
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
                 URLを追加
               </button>
-              <span class="help-text">複数のPrometheus/Alertmanagerを並列監視できます。HA構成も重複排除されます。</span>
+              <span class="help-text">GrafanaのベースURL（例: http://host:3000）と、そのGrafanaで発行したサービスアカウントトークンを各行に入力します。内蔵Alertmanager（/api/alertmanager/grafana）から取得します。複数台を並列監視でき、重複は排除されます。サーバーごとにトークンが異なるため、URLとトークンは行単位で対応します。</span>
             </div>
 
             <div class="form-group">
@@ -96,7 +96,7 @@
                 <input type="range" id="input-interval" min="10" max="300" step="5" value="60" />
                 <span id="interval-val" class="range-value">60秒</span>
               </div>
-              <span class="help-text">Alertmanager APIを見に行く頻度を設定します。</span>
+              <span class="help-text">Grafana APIを見に行く頻度を設定します。</span>
             </div>
 
             <div class="form-group" style="margin-top: 24px;">

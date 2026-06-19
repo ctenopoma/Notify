@@ -1,17 +1,24 @@
 """Render every monitoring config file from a single state dict.
 
 `monitor-config.json` (edited via the web UI) is the source of truth. From it we
-generate prometheus.yml, alert.rules.yml, alertmanager.yml, promtail-config.yml,
-loki-config.yml, the Loki log-alert rules, dcgm-counters.csv and the .env file
+generate prometheus.yml, the Grafana unified-alerting rule provisioning
+(grafana/provisioning/alerting/rules.yml), dcgm-counters.csv and the .env file
 that feeds docker-compose (retention / log-rotation knobs).
+
+Alerting lives entirely in Grafana now: Grafana evaluates the rules against the
+Prometheus datasource and its embedded Alertmanager exposes them at
+/api/alertmanager/grafana/api/v2/alerts — which the Notify desktop app polls.
+There is no standalone Alertmanager, Loki or promtail.
 
 The generated files intentionally match docs/monitoring_setup.md so the doc
 stays an accurate description of what the stack runs.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -29,17 +36,14 @@ def default_state() -> dict:
             # Prometheus tsdb retention (time and/or size; "0" disables that limit)
             "prometheus_time": "15d",
             "prometheus_size": "0",
-            # Loki log retention window (Go duration, e.g. 168h = 7d)
-            "loki_period": "168h",
             # Docker json-file log rotation for *this stack's* containers
             "log_max_size": "10m",
             "log_max_file": "3",
         },
+        # Only `heartbeat`/`heartbeat_alert` are still used — they drive the
+        # always-firing Grafana rule the Notify app uses as a connection probe.
+        # (Routing/grouping now lives in Grafana's notification policy.)
         "alertmanager": {
-            "resolve_timeout": "5m",
-            "group_wait": "10s",
-            "group_interval": "10s",
-            "repeat_interval": "1h",
             "heartbeat": True,
             "heartbeat_alert": "AlwaysFiringTest",
         },
@@ -50,14 +54,10 @@ def default_state() -> dict:
             {
                 "name": "vllm", "scrape": True, "metrics_path": "/metrics",
                 "target": "vllm:8000", "cadvisor_liveness": True, "absent_alert": True,
-                "logs": True, "log_patterns": "(?i)error|exception|cuda|out of memory",
-                "log_threshold": 0,
             },
             {
                 "name": "litellm", "scrape": True, "metrics_path": "/metrics",
                 "target": "litellm:4000", "cadvisor_liveness": True, "absent_alert": True,
-                "logs": True, "log_patterns": "(?i)error|exception",
-                "log_threshold": 0,
             },
         ],
         # Free-form extra scrape jobs (custom exporters etc.)
@@ -121,8 +121,8 @@ def render_prometheus(state: dict) -> str:
             "scrape_interval": g.get("scrape_interval", "15s"),
             "evaluation_interval": g.get("evaluation_interval", "15s"),
         },
-        "alerting": {"alertmanagers": [{"static_configs": [{"targets": ["alertmanager:9093"]}]}]},
-        "rule_files": ["alert.rules.yml"],
+        # No `alerting`/`rule_files`: rule evaluation and routing moved to Grafana
+        # unified alerting. Prometheus is now purely a metrics store/query engine.
         "scrape_configs": [
             {"job_name": "prometheus", "static_configs": [{"targets": ["localhost:9090"]}]},
         ],
@@ -154,65 +154,67 @@ def render_prometheus(state: dict) -> str:
     return header + _dump(cfg)
 
 
-def render_alert_rules(state: dict) -> str:
-    groups = []
+# Datasource UID that the Prometheus datasource is provisioned with
+# (see grafana/provisioning/datasources/datasources.yml).
+_PROM_DS_UID = "prometheus"
+_ALERT_FOLDER = "Notify Alerts"
+
+
+def _collect_alert_rules(state: dict) -> list[tuple[str, list[dict]]]:
+    """Gather every alert as (group_name, [intermediate rule dicts]).
+
+    Each intermediate rule is {name, expr (PromQL), for, severity, summary,
+    description}. This is the provider-neutral shape that both the heartbeat /
+    liveness / cAdvisor auto-rules and the user/GPU/resource rules share; the
+    Grafana renderer below turns it into the unified-alerting graph format.
+    """
+    groups: list[tuple[str, list[dict]]] = []
 
     am = state.get("alertmanager", {})
     if am.get("heartbeat", True):
-        groups.append({
-            "name": "heartbeat_rules",
-            "rules": [{
-                "alert": am.get("heartbeat_alert", "AlwaysFiringTest"),
-                "expr": "vector(1)", "for": "10s",
-                "labels": {"severity": "warning"},
-                "annotations": {
-                    "summary": "Notify 接続テスト用アラート",
-                    "description": "常時発火。Notify アプリの接続確認に使用します。",
-                },
-            }],
-        })
+        groups.append(("heartbeat_rules", [{
+            "name": am.get("heartbeat_alert", "AlwaysFiringTest"),
+            "expr": "vector(1)", "for": "10s", "severity": "warning",
+            "summary": "Notify 接続テスト用アラート",
+            "description": "常時発火。Notify アプリの接続確認に使用します。",
+        }]))
 
     # Liveness via /metrics up==0
     liveness = []
     for c in state.get("containers", []):
         if c.get("scrape"):
             liveness.append({
-                "alert": _pascal(c["name"]) + "Down",
+                "name": _pascal(c["name"]) + "Down",
                 "expr": 'up{job="%s"} == 0' % c["name"],
-                "for": "1m",
-                "labels": {"severity": "critical"},
-                "annotations": {
-                    "summary": "%s が応答していません" % c["name"],
-                    "description": "%s (job=%s) のスクレイプに1分以上失敗しています。" % (c["name"], c["name"]),
-                },
+                "for": "1m", "severity": "critical",
+                "summary": "%s が応答していません" % c["name"],
+                "description": "%s (job=%s) のスクレイプに1分以上失敗しています。" % (c["name"], c["name"]),
             })
     if liveness:
-        groups.append({"name": "llm_liveness", "rules": liveness})
+        groups.append(("llm_liveness", liveness))
 
     # cAdvisor-based liveness (stalled + absent)
     cadv_rules = []
     watched = [c["name"] for c in state.get("containers", []) if c.get("cadvisor_liveness")]
     if watched:
         cadv_rules.append({
-            "alert": "WatchedContainerStalled",
+            "name": "WatchedContainerStalled",
             "expr": 'time() - container_last_seen{name=~"%s"} > 60' % "|".join(watched),
-            "labels": {"severity": "critical"},
-            "annotations": {
-                "summary": "コンテナ [{{ $labels.name }}] が60秒以上観測されていません",
-                "description": "停止または再起動中の可能性があります。",
-            },
+            "for": "0s", "severity": "critical",
+            "summary": "コンテナ [{{ $labels.name }}] が60秒以上観測されていません",
+            "description": "停止または再起動中の可能性があります。",
         })
     for c in state.get("containers", []):
         if c.get("absent_alert"):
             cadv_rules.append({
-                "alert": _pascal(c["name"]) + "ContainerAbsent",
+                "name": _pascal(c["name"]) + "ContainerAbsent",
                 "expr": 'absent(container_last_seen{name="%s"})' % c["name"],
-                "for": "1m",
-                "labels": {"severity": "critical"},
-                "annotations": {"summary": "%s コンテナが存在しません" % c["name"]},
+                "for": "1m", "severity": "critical",
+                "summary": "%s コンテナが存在しません" % c["name"],
+                "description": "",
             })
     if cadv_rules:
-        groups.append({"name": "llm_container_liveness", "rules": cadv_rules})
+        groups.append(("llm_container_liveness", cadv_rules))
 
     # User/GPU/resource alerts, grouped by their `group` field, order preserved.
     by_group: dict[str, list] = {}
@@ -224,116 +226,116 @@ def render_alert_rules(state: dict) -> str:
         if grp not in by_group:
             by_group[grp] = []
             order.append(grp)
-        rule = {"alert": a["name"], "expr": a["expr"]}
-        if a.get("for"):
-            rule["for"] = a["for"]
-        rule["labels"] = {"severity": a.get("severity", "warning")}
-        ann = {}
-        if a.get("summary"):
-            ann["summary"] = a["summary"]
-        if a.get("description"):
-            ann["description"] = a["description"]
-        if ann:
-            rule["annotations"] = ann
-        by_group[grp].append(rule)
-    for grp in order:
-        groups.append({"name": grp, "rules": by_group[grp]})
-
-    header = "# AUTO-GENERATED by the Notify monitoring web admin.\n"
-    return header + _dump({"groups": groups})
-
-
-def render_alertmanager(state: dict) -> str:
-    am = state.get("alertmanager", {})
-    cfg = {
-        "global": {"resolve_timeout": am.get("resolve_timeout", "5m")},
-        "route": {
-            "group_by": ["alertname"],
-            "group_wait": am.get("group_wait", "10s"),
-            "group_interval": am.get("group_interval", "10s"),
-            "repeat_interval": am.get("repeat_interval", "1h"),
-            "receiver": "default-receiver",
-        },
-        "receivers": [{"name": "default-receiver"}],
-    }
-    return "# AUTO-GENERATED by the Notify monitoring web admin.\n" + _dump(cfg)
-
-
-def render_promtail(state: dict) -> str:
-    names = [c["name"] for c in state.get("containers", []) if c.get("logs")]
-    keep_regex = "/(%s)" % "|".join(names) if names else "/(__none__)"
-    cfg = {
-        "server": {"http_listen_port": 9080, "grpc_listen_port": 0},
-        "positions": {"filename": "/tmp/positions.yaml"},
-        "clients": [{"url": "http://loki:3100/loki/api/v1/push"}],
-        "scrape_configs": [{
-            "job_name": "docker_llm",
-            "docker_sd_configs": [{"host": "unix:///var/run/docker.sock", "refresh_interval": "5s"}],
-            "relabel_configs": [
-                {"source_labels": ["__meta_docker_container_name"], "regex": keep_regex, "action": "keep"},
-                {"source_labels": ["__meta_docker_container_name"], "regex": "/(.*)", "target_label": "container"},
-            ],
-        }],
-    }
-    return "# AUTO-GENERATED by the Notify monitoring web admin.\n" + _dump(cfg)
-
-
-def render_loki_config(state: dict) -> str:
-    period = state.get("retention", {}).get("loki_period", "168h")
-    cfg = {
-        "auth_enabled": False,
-        "server": {"http_listen_port": 3100},
-        "common": {
-            "path_prefix": "/tmp/loki",
-            "storage": {"filesystem": {
-                "chunks_directory": "/tmp/loki/chunks",
-                "rules_directory": "/tmp/loki/rules",
-            }},
-            "replication_factor": 1,
-            "ring": {"kvstore": {"store": "inmemory"}},
-        },
-        "schema_config": {"configs": [{
-            "from": "2020-10-24", "store": "tsdb", "object_store": "filesystem",
-            "schema": "v13", "index": {"prefix": "index_", "period": "24h"},
-        }]},
-        # Retention: enabled in the compactor so old logs are deleted, capping disk.
-        "limits_config": {"retention_period": period},
-        "compactor": {
-            "working_directory": "/tmp/loki/compactor",
-            "retention_enabled": True,
-            "delete_request_store": "filesystem",
-        },
-        "ruler": {
-            "alertmanager_url": "http://alertmanager:9093",
-            "rule_path": "/tmp/loki/scratch",
-            "storage": {"type": "local", "local": {"directory": "/etc/loki/rules"}},
-            "enable_api": True,
-        },
-    }
-    return "# AUTO-GENERATED by the Notify monitoring web admin.\n" + _dump(cfg)
-
-
-def render_loki_rules(state: dict) -> str:
-    rules = []
-    for c in state.get("containers", []):
-        if not c.get("logs"):
-            continue
-        patt = c.get("log_patterns", "(?i)error|exception")
-        thr = c.get("log_threshold", 0)
-        rules.append({
-            "alert": _pascal(c["name"]) + "ErrorLog",
-            "expr": ("sum by (container) (\n"
-                     "  count_over_time({container=\"%s\"} |~ `%s` [5m])\n"
-                     ") > %s" % (c["name"], patt, thr)),
-            "for": "0m",
-            "labels": {"severity": "warning"},
-            "annotations": {
-                "summary": "%s コンテナでエラーログを検知しました" % c["name"],
-                "description": "直近5分でエラー/例外等のログ行を %s 件超検知しました。" % thr,
-            },
+        by_group[grp].append({
+            "name": a["name"],
+            "expr": a["expr"],
+            "for": a.get("for") or "0s",
+            "severity": a.get("severity", "warning"),
+            "summary": a.get("summary", ""),
+            "description": a.get("description", ""),
         })
-    doc = {"groups": [{"name": "llm_log_rules", "rules": rules}]} if rules else {"groups": []}
-    return "# AUTO-GENERATED by the Notify monitoring web admin.\n" + _dump(doc)
+    for grp in order:
+        groups.append((grp, by_group[grp]))
+
+    return groups
+
+
+# Grafana annotation templating uses `{{ $values.X }}`, not Prometheus's
+# `{{ $value }}`. Our condition query always evaluates to 1 (see _to_grafana_rule),
+# so `$value` carries no meaning here — strip those mustaches to avoid template
+# errors while preserving `{{ $labels.X }}`, which Grafana renders natively.
+_VALUE_MUSTACHE = re.compile(r"\{\{-?\s*\$value.*?\}\}")
+
+
+def _sanitize_annotation(text: str) -> str:
+    return _VALUE_MUSTACHE.sub("", text or "").strip()
+
+
+def _rule_uid(group: str, name: str) -> str:
+    digest = hashlib.sha1(("%s/%s" % (group, name)).encode("utf-8")).hexdigest()
+    return "notify-" + digest[:20]
+
+
+def _to_grafana_rule(group: str, r: dict) -> dict:
+    """Convert an intermediate rule into a Grafana unified-alerting rule.
+
+    The PromQL expr `E` already encodes the firing condition by *filtering*
+    (e.g. `temp > 85` returns the value only when true; `up == 0` returns 0 when
+    firing). We wrap it as `(E) * 0 + 1` so every series that passes the filter
+    yields exactly 1 — making a single `> 0` threshold a correct, uniform firing
+    test even for `== 0` style rules. When `E` matches nothing the query returns
+    no data, and `noDataState: OK` keeps the rule quiet.
+    """
+    annotations = {}
+    summary = _sanitize_annotation(r.get("summary", ""))
+    description = _sanitize_annotation(r.get("description", ""))
+    if summary:
+        annotations["summary"] = summary
+    if description:
+        annotations["description"] = description
+
+    return {
+        "uid": _rule_uid(group, r["name"]),
+        "title": r["name"],
+        "condition": "C",
+        "for": r.get("for", "0s"),
+        "data": [
+            {
+                "refId": "A",
+                "relativeTimeRange": {"from": 600, "to": 0},
+                "datasourceUid": _PROM_DS_UID,
+                "model": {
+                    "refId": "A",
+                    "editorMode": "code",
+                    "expr": "(%s) * 0 + 1" % r["expr"],
+                    "instant": True,
+                    "range": False,
+                    "intervalMs": 1000,
+                    "maxDataPoints": 43200,
+                    "legendFormat": "__auto",
+                },
+            },
+            {
+                "refId": "C",
+                "relativeTimeRange": {"from": 600, "to": 0},
+                "datasourceUid": "__expr__",
+                "model": {
+                    "refId": "C",
+                    "type": "threshold",
+                    "expression": "A",
+                    "conditions": [{"evaluator": {"type": "gt", "params": [0]}}],
+                    "intervalMs": 1000,
+                    "maxDataPoints": 43200,
+                },
+            },
+        ],
+        "noDataState": "OK",
+        "execErrState": "Error",
+        "labels": {"severity": r.get("severity", "warning")},
+        "annotations": annotations,
+    }
+
+
+def render_grafana_alerting(state: dict) -> str:
+    """Grafana unified-alerting provisioning (folder + rule groups).
+
+    Grafana evaluates these against the Prometheus datasource and surfaces firing
+    instances on its embedded Alertmanager API, which the Notify desktop app polls.
+    """
+    groups = []
+    for group_name, rules in _collect_alert_rules(state):
+        if not rules:
+            continue
+        groups.append({
+            "orgId": 1,
+            "name": group_name,
+            "folder": _ALERT_FOLDER,
+            "interval": "1m",
+            "rules": [_to_grafana_rule(group_name, r) for r in rules],
+        })
+
+    header = "# AUTO-GENERATED by the Notify monitoring web admin. Edit via http://<host>:8088.\n"
+    return header + _dump({"apiVersion": 1, "groups": groups})
 
 
 def render_dcgm_csv(state: dict) -> str:
@@ -405,11 +407,7 @@ def _pascal(name: str) -> str:
 # Maps logical file -> (relative path under config/, renderer)
 FILES = {
     "prometheus": ("prometheus.yml", render_prometheus),
-    "alerts": ("alert.rules.yml", render_alert_rules),
-    "alertmanager": ("alertmanager.yml", render_alertmanager),
-    "promtail": ("promtail-config.yml", render_promtail),
-    "loki": ("loki-config.yml", render_loki_config),
-    "loki_rules": ("loki-rules/fake/llm-log-rules.yml", render_loki_rules),
+    "grafana_alerts": ("grafana/provisioning/alerting/rules.yml", render_grafana_alerting),
     "dcgm": ("dcgm-counters.csv", render_dcgm_csv),
 }
 

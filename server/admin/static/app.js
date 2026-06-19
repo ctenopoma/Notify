@@ -158,14 +158,11 @@ function containerItem(c, i) {
     <div class="grid">
       <label>スクレイプ先 (host:port)<input type="text" data-f="target" value="${esc(c.target || '')}" placeholder="vllm:8000" /></label>
       <label>metrics パス<input type="text" data-f="metrics_path" value="${esc(c.metrics_path || '/metrics')}" /></label>
-      <label>ログ検知パターン (regex)<input type="text" data-f="log_patterns" value="${esc(c.log_patterns || '')}" placeholder="(?i)error|exception" /></label>
-      <label>ログしきい値 (件超で発火)<input type="number" data-f="log_threshold" value="${c.log_threshold ?? 0}" /></label>
     </div>
     <div class="checks">
       <label><input type="checkbox" data-f="scrape" ${c.scrape ? 'checked' : ''} /> /metrics 死活</label>
       <label><input type="checkbox" data-f="cadvisor_liveness" ${c.cadvisor_liveness ? 'checked' : ''} /> cAdvisor 死活</label>
       <label><input type="checkbox" data-f="absent_alert" ${c.absent_alert ? 'checked' : ''} /> 消失アラート</label>
-      <label><input type="checkbox" data-f="logs" ${c.logs ? 'checked' : ''} /> エラーログ収集</label>
     </div>
   </div>`;
 }
@@ -176,8 +173,7 @@ function bindContainerItems() {
     $$('[data-f]', el).forEach((inp) => {
       inp.addEventListener('change', () => {
         const f = inp.dataset.f;
-        STATE.containers[i][f] = inp.type === 'checkbox' ? inp.checked
-          : (f === 'log_threshold' ? +inp.value : inp.value);
+        STATE.containers[i][f] = inp.type === 'checkbox' ? inp.checked : inp.value;
         markDirty();
       });
     });
@@ -192,8 +188,7 @@ function bindContainerItems() {
 function addContainer(name = '') {
   STATE.containers.push({
     name, scrape: true, metrics_path: '/metrics', target: name ? name + ':8000' : '',
-    cadvisor_liveness: true, absent_alert: true, logs: true,
-    log_patterns: '(?i)error|exception', log_threshold: 0,
+    cadvisor_liveness: true, absent_alert: true,
   });
   markDirty(); renderTargets(); renderDiscoverAddOptions();
 }
@@ -349,12 +344,11 @@ function renderRetention() {
   const r = STATE.retention || (STATE.retention = {});
   $('#prom-time').value = r.prometheus_time || '';
   $('#prom-size').value = r.prometheus_size || '';
-  $('#loki-period').value = r.loki_period || '';
   $('#log-max-size').value = r.log_max_size || '';
   $('#log-max-file').value = r.log_max_file || '';
   const map = {
     '#prom-time': 'prometheus_time', '#prom-size': 'prometheus_size',
-    '#loki-period': 'loki_period', '#log-max-size': 'log_max_size', '#log-max-file': 'log_max_file',
+    '#log-max-size': 'log_max_size', '#log-max-file': 'log_max_file',
   };
   Object.entries(map).forEach(([sel, key]) =>
     $(sel).addEventListener('change', () => { r[key] = $(sel).value; markDirty(); }));
@@ -363,9 +357,8 @@ function renderRetention() {
 // --- Preview & ops ----------------------------------------------------------
 function renderPreviewPicker() {
   const files = {
-    prometheus: 'prometheus.yml', alerts: 'alert.rules.yml', alertmanager: 'alertmanager.yml',
-    promtail: 'promtail-config.yml', loki: 'loki-config.yml',
-    loki_rules: 'loki ログルール', dcgm: 'dcgm-counters.csv', env: '.env',
+    prometheus: 'prometheus.yml', grafana_alerts: 'Grafana アラートルール',
+    dcgm: 'dcgm-counters.csv', env: '.env',
   };
   $('#preview-picker').innerHTML = Object.entries(files)
     .map(([k, v]) => `<option value="${k}">${v}</option>`).join('');

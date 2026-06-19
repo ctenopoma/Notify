@@ -1,0 +1,37 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Notify">
+  <defs>
+    <!-- Indigo brand gradient -->
+    <linearGradient id="bg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#818cf8"/>
+      <stop offset="0.55" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+    <linearGradient id="bell" x1="160" y1="120" x2="360" y2="400" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e0e7ff"/>
+    </linearGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#1e1b4b" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Squircle backdrop -->
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="url(#bg)"/>
+  <!-- Subtle top glow -->
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="#ffffff" opacity="0.06"/>
+
+  <g filter="url(#soft)">
+    <!-- Bell body -->
+    <path d="M256 116c-58 0-100 44-100 110 0 70-18 104-40 128-10 11-2 30 14 30h252c16 0 24-19 14-30-22-24-40-58-40-128 0-66-42-110-100-110z"
+          fill="url(#bell)"/>
+    <!-- Clapper -->
+    <path d="M222 408a34 34 0 0 0 68 0z" fill="url(#bell)"/>
+  </g>
+
+  <!-- Top knob -->
+  <circle cx="256" cy="104" r="22" fill="#ffffff"/>
+
+  <!-- Signal ping accent -->
+  <circle cx="372" cy="150" r="26" fill="#f43f5e"/>
+  <circle cx="372" cy="150" r="26" fill="none" stroke="#ffffff" stroke-width="6" opacity="0.85"/>
+</svg>
