@@ -91,7 +91,9 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - ./config/dcgm-counters.csv:/etc/dcgm-exporter/custom-counters.csv
-    command: ["-f", "/etc/dcgm-exporter/custom-counters.csv"]
+      - ./config/dcgm-start.sh:/etc/dcgm-exporter/dcgm-start.sh:ro
+    # Self-healing wrapper: drops unsupported DEV fields instead of dying on them.
+    entrypoint: ["sh", "/etc/dcgm-exporter/dcgm-start.sh"]
     ports:
       - "${DCGM_PORT:-9400}:9400"
     restart: unless-stopped
